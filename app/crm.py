@@ -202,6 +202,14 @@ class CrmClient:
         if resp.status_code != 200:
             raise CrmError(f"reset devolvió {resp.status_code}")
 
+    async def post_activate(self, conversation_id: str) -> None:
+        """Reactiva solo la IA del chat; conserva ficha, etapa e historial."""
+        resp = await self._request(
+            "POST", "/api/bot/activate", json={"conversationId": conversation_id}
+        )
+        if resp.status_code != 200:
+            raise CrmError(f"activate devolvió {resp.status_code}")
+
     async def get_media(self, media_id: str) -> tuple[bytes, str]:
         """Descarga un binario de Meta A TRAVÉS del CRM (el token vive allá).
 

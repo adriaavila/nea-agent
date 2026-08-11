@@ -46,8 +46,8 @@ class BusinessProfile:
     greeting: str | None = None
     kb_text: str | None = None
     resources: list[dict[str, str]] = field(default_factory=list)
-    preset_only: bool = False
-    preset_replies: tuple[tuple[str, str], ...] = ()
+    activation_enabled: bool = False
+    activation_messages: tuple[str, ...] = ()
 
     @property
     def has_knowledge(self) -> bool:
@@ -66,12 +66,10 @@ def profile_from_payload(payload: dict[str, Any], default_name: str) -> Business
         for r in resources_raw
         if isinstance(r, dict) and r.get("url")
     ]
-    preset_replies = tuple(
-        (str(item["message"]), str(item["response"]))
-        for item in prof.get("presetReplies") or []
-        if isinstance(item, dict)
-        and str(item.get("message") or "").strip()
-        and str(item.get("response") or "").strip()
+    activation_messages = tuple(
+        str(item).strip()
+        for item in prof.get("activationMessages") or []
+        if str(item).strip()
     )
     return BusinessProfile(
         agent_name=str(prof.get("name") or default_name),
@@ -81,8 +79,8 @@ def profile_from_payload(payload: dict[str, Any], default_name: str) -> Business
         greeting=prof.get("greeting") or None,
         kb_text=kb_text,
         resources=resources,
-        preset_only=bool(prof.get("presetOnly")),
-        preset_replies=preset_replies,
+        activation_enabled=bool(prof.get("activationEnabled")),
+        activation_messages=activation_messages,
     )
 
 

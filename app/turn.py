@@ -37,15 +37,11 @@ def _normalized_message(text: str) -> str:
     return " ".join(text.split()).casefold()
 
 
-def _preset_response(profile: Any, text: str) -> str | None:
-    incoming = _normalized_message(text)
-    return next(
-        (
-            response.strip()
-            for message, response in profile.preset_replies
-            if _normalized_message(message) == incoming
-        ),
-        None,
+def _activation_matches(profile: Any, inbound: list[InboundMessage]) -> bool:
+    incoming = _normalized_message("\n".join(m.text for m in inbound if m.text))
+    return bool(incoming) and any(
+        _normalized_message(message) == incoming
+        for message in profile.activation_messages
     )
 
 
@@ -100,9 +96,21 @@ async def run_turn(
     if not crm_conv_id:
         logger.warning("turno %s: contexto sin conversationId — silencio", identity)
         return
+    profile = await resolve_profile(ctx)
     if not conversation_info.get("aiEnabled", False):
-        logger.info("turno %s: aiEnabled=false (handoff activo) — silencio", identity)
-        return
+        if not profile.activation_enabled or not _activation_matches(profile, inbound):
+            logger.info("turno %s: chat pausado y sin mensaje activador — silencio", identity)
+            return
+        try:
+            await ctx.crm.post_activate(str(crm_conv_id))
+        except CrmError as exc:
+            logger.warning("turno %s: no pude activar el chat (%s) — silencio", identity, exc)
+            return
+        conversation_info["aiEnabled"] = True
+        await ctx.store.update_conversation(
+            conv.id, phase="descubrimiento", followup_due_at=None
+        )
+        logger.info("turno %s: IA activada por mensaje configurado", identity)
     if not conversation_info.get("windowOpen", False):
         logger.info("turno %s: ventana de 24 h cerrada — silencio", identity)
         return
@@ -143,19 +151,6 @@ async def run_turn(
     await ctx.store.add_message(
         conv.id, "user", user_text, wa_message_id=inbound[0].wa_message_id
     )
-
-    profile = await resolve_profile(ctx)
-    if profile.preset_only:
-        reply = _preset_response(profile, user_text)
-        if not reply:
-            logger.info("turno %s: sin respuesta predeterminada — silencio", identity)
-            return
-        if await _send(ctx, conv.id, str(crm_conv_id), reply):
-            await ctx.store.add_message(conv.id, "assistant", reply)
-            await ctx.store.update_conversation(
-                conv.id, greeted=True, followup_due_at=None
-            )
-        return
 
     # --- Armar mensajes para el LLM ---------------------------------------
     referral = next((m.referral_headline for m in inbound if m.referral_headline), None)
@@ -270,7 +265,13 @@ async def _fetch_context(ctx: AppContext, identity: str) -> dict[str, Any] | Non
                 exc,
             )
             context = None
-        if context is not None:
+        # El relay y este turno corren en paralelo. Un chat conocido puede
+        # llegar todavía con la ventana vieja cerrada; espera a que el CRM
+        # persista el mensaje entrante que acaba de reabrirla.
+        if context is not None and (
+            (context.get("conversation") or {}).get("windowOpen", False)
+            or attempt == CONTEXT_ATTEMPTS - 1
+        ):
             return context
         if attempt < CONTEXT_ATTEMPTS - 1:
             await asyncio.sleep(1.0)  # chance a que el relay aterrice en el CRM

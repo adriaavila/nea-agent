@@ -36,10 +36,8 @@ PAYLOAD = {
         "instructions": "Vendemos limpiezas dentales. Califica: adultos en la ciudad.",
         "escalationRules": "Urgencias de dolor → humano de inmediato.",
         "greeting": "¡Hola! Soy Sofi, la asistente de la clínica 🦷",
-        "presetOnly": True,
-        "presetReplies": [
-            {"message": "horario", "response": "Atendemos de 8 a 5."}
-        ],
+        "activationEnabled": True,
+        "activationMessages": ["quiero agendar"],
     },
     "kb": "P: ¿Cuánto cuesta la limpieza?\nR: $800 MXN.",
     "resources": [{"label": "Guía de higiene", "url": "https://example.com/guia"}],
@@ -53,8 +51,8 @@ def test_profile_from_payload_mapea_todo():
     assert prof.escalation_rules and "Urgencias" in prof.escalation_rules
     assert prof.kb_text and "$800" in prof.kb_text
     assert prof.resources == [{"label": "Guía de higiene", "url": "https://example.com/guia"}]
-    assert prof.preset_only
-    assert prof.preset_replies == (("horario", "Atendemos de 8 a 5."),)
+    assert prof.activation_enabled
+    assert prof.activation_messages == ("quiero agendar",)
     assert prof.has_knowledge
 
 

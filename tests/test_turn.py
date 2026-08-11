@@ -9,27 +9,29 @@ from app.profile import BusinessProfile
 from tests.conftest import mock_crm_basics, wa_body
 
 
-class PresetProfile:
+class ActivationProfile:
     async def get(self):
         return BusinessProfile(
-            preset_only=True,
-            preset_replies=(("Horario", "Atendemos de 8:00 a 17:00."),),
+            activation_enabled=True,
+            activation_messages=("Quiero agendar",),
         )
 
 
-async def test_modo_predeterminado_solo_responde_coincidencias(ctx, client, respx_mock):
-    routes = mock_crm_basics(respx_mock)
-    ctx.profile = PresetProfile()
+async def test_mensaje_configurado_activa_chat_y_conversa(ctx, client, respx_mock):
+    routes = mock_crm_basics(respx_mock, ai_enabled=False)
+    ctx.profile = ActivationProfile()
 
-    await client.post("/webhook", content=wa_body(text="  HORARIO "))
+    await client.post("/webhook", content=wa_body(text="  QUIERO AGENDAR "))
     await asyncio.sleep(0.2)
+    assert routes["activate"].call_count == 1
     assert routes["messages"].call_count == 1
-    assert ctx.llm.calls == []
+    assert len(ctx.llm.calls) == 1
 
     await client.post("/webhook", content=wa_body(text="otra pregunta", wamid="wamid.2"))
     await asyncio.sleep(0.2)
+    assert routes["activate"].call_count == 1
     assert routes["messages"].call_count == 1
-    assert ctx.llm.calls == []
+    assert len(ctx.llm.calls) == 1
 
 
 async def test_handoff_despedida_primero_pausa_despues(ctx, client, respx_mock):

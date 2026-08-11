@@ -222,6 +222,9 @@ def mock_crm_basics(respx_mock: Any, **context_kwargs: Any) -> dict[str, Any]:
                 json={},
             )
         ),
+        "activate": respx_mock.post(f"{CRM_URL}/api/bot/activate").mock(
+            return_value=httpx.Response(200, json={"ok": True})
+        ),
         "typing": respx_mock.post(f"{CRM_URL}/api/bot/typing").mock(
             return_value=httpx.Response(200, json={"ok": True})
         ),
