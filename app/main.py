@@ -62,9 +62,14 @@ def create_app(ctx: AppContext | None = None) -> FastAPI:
                 store=store,
                 crm=crm,
                 llm=OpenAiLlm(
-                    settings.openai_api_key,
-                    settings.openai_model,
+                    settings.openrouter_api_token or settings.openai_api_key,
+                    settings.openrouter_model or settings.openai_model,
                     transcribe_model=settings.openai_transcribe_model,
+                    base_url=(
+                        "https://openrouter.ai/api/v1"
+                        if settings.openrouter_api_token
+                        else None
+                    ),
                 ),
                 profile=ProfileProvider(
                     crm,

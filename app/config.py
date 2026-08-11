@@ -45,6 +45,8 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     openai_model: str = "gpt-4o-mini"
     openai_transcribe_model: str = "whisper-1"  # notas de voz → texto
+    openrouter_api_token: str = ""
+    openrouter_model: str = ""
     history_window: int = 10
 
     # Guardarraíles y tiempos

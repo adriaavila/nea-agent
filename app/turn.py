@@ -33,6 +33,22 @@ CONTEXT_ATTEMPTS = 3  # el relay puede tardar un instante en aterrizar en el CRM
 RESET_COMMANDS = frozenset({"/reset", "#reset"})
 
 
+def _normalized_message(text: str) -> str:
+    return " ".join(text.split()).casefold()
+
+
+def _preset_response(profile: Any, text: str) -> str | None:
+    incoming = _normalized_message(text)
+    return next(
+        (
+            response.strip()
+            for message, response in profile.preset_replies
+            if _normalized_message(message) == incoming
+        ),
+        None,
+    )
+
+
 def _agent_tz(settings: Any) -> ZoneInfo:
     try:
         return ZoneInfo(getattr(settings, "agent_timezone", "") or "America/Mexico_City")
@@ -128,10 +144,22 @@ async def run_turn(
         conv.id, "user", user_text, wa_message_id=inbound[0].wa_message_id
     )
 
+    profile = await resolve_profile(ctx)
+    if profile.preset_only:
+        reply = _preset_response(profile, user_text)
+        if not reply:
+            logger.info("turno %s: sin respuesta predeterminada — silencio", identity)
+            return
+        if await _send(ctx, conv.id, str(crm_conv_id), reply):
+            await ctx.store.add_message(conv.id, "assistant", reply)
+            await ctx.store.update_conversation(
+                conv.id, greeted=True, followup_due_at=None
+            )
+        return
+
     # --- Armar mensajes para el LLM ---------------------------------------
     referral = next((m.referral_headline for m in inbound if m.referral_headline), None)
     offered = await ctx.store.get_offered_slots(conv.id)
-    profile = await resolve_profile(ctx)
     system = build_system_prompt(
         profile=profile,
         context=context,
