@@ -20,7 +20,7 @@ from typing import Any
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 
-from app.config import canonical_identity
+from app.config import access_policy, canonical_identity
 from app.state import AppContext, InboundMessage
 
 logger = logging.getLogger("nea.webhook")
@@ -245,12 +245,15 @@ async def _early_typing(ctx: AppContext, identity: str) -> None:
     """
     try:
         await asyncio.sleep(ctx.settings.typing_delay_seconds)
-        allowed = ctx.settings.allowed_identities
-        if allowed and canonical_identity(identity) not in allowed:
+        context = await ctx.crm.get_context(identity)
+        if context is None:
             return
-        conv = await ctx.store.get_or_create_conversation(identity)
-        if not conv.crm_conversation_id:
+        restricted, allowed = access_policy(ctx.settings, context)
+        if restricted and canonical_identity(identity) not in allowed:
             return
-        await ctx.crm.post_typing(str(conv.crm_conversation_id))
+        conversation_id = (context.get("conversation") or {}).get("id")
+        if not conversation_id:
+            return
+        await ctx.crm.post_typing(str(conversation_id))
     except Exception as exc:
         logger.debug("typing temprano de %s falló (%s) — sigo", identity, exc)

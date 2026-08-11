@@ -40,7 +40,7 @@ async def test_allowlist_fuera_relay_si_respuesta_no(allow_ctx, allow_client, re
     )
     await asyncio.sleep(0.2)
     assert len(allow_ctx.store.relays) == 1  # relay sí
-    assert routes["context"].call_count == 0  # ni siquiera consulta contexto
+    assert routes["context"].call_count >= 1  # la política ahora vive en el CRM
     assert routes["messages"].call_count == 0  # respuesta no
     assert len(allow_ctx.llm.calls) == 0
 
@@ -57,11 +57,31 @@ async def test_allowlist_dentro_con_canonicalizacion_521(
     assert routes["messages"].call_count == 1
 
 
+async def test_ui_puede_desactivar_allowlist(allow_ctx, allow_client, respx_mock):
+    routes = mock_crm_basics(respx_mock, allowlist_enabled=False)
+    await allow_client.post(
+        "/webhook", content=wa_body(frm="529999999999", wamid="wamid.ui-off")
+    )
+    await asyncio.sleep(0.2)
+    assert routes["messages"].call_count == 1
+
+
+async def test_ui_restringe_a_sus_numeros(ctx, client, respx_mock):
+    routes = mock_crm_basics(
+        respx_mock,
+        allowlist_enabled=True,
+        allowed_wa_ids=["529999999999"],
+    )
+    await client.post("/webhook", content=wa_body(wamid="wamid.ui-on"))
+    await asyncio.sleep(0.2)
+    assert routes["messages"].call_count == 0
+
+
 async def test_ai_pausada_silencio(ctx, client, respx_mock):
     routes = mock_crm_basics(respx_mock, ai_enabled=False)
     await client.post("/webhook", content=wa_body())
     await asyncio.sleep(0.2)
-    assert routes["context"].call_count == 1  # sí consultó el contexto
+    assert routes["context"].call_count >= 1  # sí consultó el contexto
     assert len(ctx.llm.calls) == 0  # pero no conversó
     assert routes["messages"].call_count == 0
 

@@ -366,7 +366,7 @@ async def test_typing_se_dispara_y_su_fallo_no_afecta(ctx, client, respx_mock):
     routes["typing"].mock(return_value=httpx.Response(500))  # CRM/Meta caídos
     await client.post("/webhook", content=wa_body(text="hola", wamid="wamid.typ1"))
     await asyncio.sleep(0.3)
-    assert routes["typing"].call_count == 1  # se intentó la señal de vida
+    assert routes["typing"].call_count >= 1  # se intentó la señal de vida
     assert routes["messages"].call_count == 1  # y el turno respondió igual
 
 

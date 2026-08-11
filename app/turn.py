@@ -14,7 +14,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from app import media
-from app.config import canonical_identity
+from app.config import access_policy, canonical_identity
 from app.crm import CrmConflict, CrmError
 from app.hostility import ALERT as HOSTILITY_ALERT, hostile_streak
 from app.llm import LlmExhausted
@@ -67,11 +67,15 @@ async def run_turn(
 ) -> None:
     settings = ctx.settings
 
-    # --- Gate 1: allowlist de pruebas (Constitución V) --------------------
-    allowed = settings.allowed_identities
-    if allowed and canonical_identity(identity) not in allowed:
+    # --- Gate 1: contexto + allowlist administrada por el CRM -------------
+    context = await _fetch_context(ctx, identity)
+    if context is None:
+        logger.warning("turno %s: sin contexto del CRM — silencio", identity)
+        return
+    restricted, allowed = access_policy(settings, context)
+    if restricted and canonical_identity(identity) not in allowed:
         logger.info(
-            "allowlist: %s fuera de ALLOWED_WA_IDS — relay sí, respuesta no", identity
+            "allowlist: %s no autorizado — relay sí, respuesta no", identity
         )
         return
 
@@ -80,17 +84,13 @@ async def run_turn(
     # --- Comando /reset (líneas de prueba) --------------------------------
     # Corre ANTES de los gates de aiEnabled/ventana: un reset también debe
     # sacar la conversación de un handoff activo.
-    if canonical_identity(identity) in allowed and any(
+    if restricted and canonical_identity(identity) in allowed and any(
         (m.text or "").strip().lower() in RESET_COMMANDS for m in inbound
     ):
         await _run_reset(ctx, conv, identity)
         return
 
-    # --- Gate 2: contexto del CRM (aiEnabled, ventana) --------------------
-    context = await _fetch_context(ctx, identity)
-    if context is None:
-        logger.warning("turno %s: sin contexto del CRM — silencio", identity)
-        return
+    # --- Gate 2: aiEnabled y ventana --------------------------------------
     conversation_info = context.get("conversation") or {}
     crm_conv_id = conversation_info.get("id")
     if not crm_conv_id:

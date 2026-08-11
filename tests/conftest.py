@@ -176,8 +176,10 @@ def crm_context(
     window_open: bool = True,
     conv_id: str = CRM_CONV_ID,
     ad_headline: str | None = None,
+    allowlist_enabled: bool | None = None,
+    allowed_wa_ids: list[str] | None = None,
 ) -> dict[str, Any]:
-    return {
+    context = {
         "contact": {
             "id": "ct_1",
             "name": "Lead de Prueba",
@@ -198,6 +200,12 @@ def crm_context(
         else None,
         "booking": {"next": None},
     }
+    if allowlist_enabled is not None:
+        context["agentAccess"] = {
+            "allowlistEnabled": allowlist_enabled,
+            "allowedWaIds": allowed_wa_ids or [],
+        }
+    return context
 
 
 def mock_crm_basics(respx_mock: Any, **context_kwargs: Any) -> dict[str, Any]:

@@ -6,6 +6,8 @@ la validación de lo obligatorio ocurre al arranque real.
 """
 from __future__ import annotations
 
+from typing import Any
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -72,3 +74,16 @@ class Settings(BaseSettings):
             for part in self.allowed_wa_ids.split(",")
             if part.strip()
         )
+
+
+def access_policy(settings: Settings, context: dict[str, Any]) -> tuple[bool, frozenset[str]]:
+    """Usa la política del CRM y cae al env durante despliegues mixtos."""
+    access = context.get("agentAccess")
+    if isinstance(access, dict) and "allowlistEnabled" in access:
+        allowed = frozenset(
+            canonical_identity(str(item))
+            for item in access.get("allowedWaIds") or []
+            if str(item).strip()
+        )
+        return bool(access.get("allowlistEnabled")), allowed
+    return bool(settings.allowed_identities), settings.allowed_identities
