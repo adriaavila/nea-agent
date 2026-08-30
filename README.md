@@ -198,7 +198,8 @@ Los NUNCA del chasis en `app/prompt.py` no se relajan sin re-correr esa
 verificación de comportamiento.
 
 ```bash
-pytest -q          # 76 tests, todos offline
+pip install -r requirements-dev.txt
+pytest -q          # 86 tests, todos offline
 ```
 
 ## Configuración

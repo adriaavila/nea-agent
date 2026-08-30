@@ -1,7 +1,8 @@
 """Webhook de Meta: GET de verificación + POST de eventos.
 
 Reglas duras:
-- El POST responde 200 en <1 s SIEMPRE; el procesamiento es asíncrono.
+- El POST responde 200 tras persistir el body; si la DB falla devuelve 503 para
+  que Meta reintente. El procesamiento posterior es asíncrono.
 - Firma `x-hub-signature-256` verificada si META_APP_SECRET está configurado
   (inválida o ausente → 401). Sin secret → se acepta (dev).
 - El body crudo se encola para el relay al CRM ANTES de cualquier parseo.
@@ -173,7 +174,7 @@ async def verify(request: Request) -> PlainTextResponse:
 
 @router.post("/webhook")
 async def receive(request: Request) -> Any:
-    """200 inmediato; todo el trabajo real corre en una tarea de fondo."""
+    """Persiste antes del 200; el resto corre en una tarea de fondo."""
     ctx: AppContext = request.app.state.ctx
     body = await request.body()
     signature = request.headers.get("x-hub-signature-256")
@@ -181,21 +182,22 @@ async def receive(request: Request) -> Any:
         logger.warning("firma inválida o ausente en el webhook — 401")
         return JSONResponse({"error": "firma inválida"}, status_code=401)
 
-    task = asyncio.create_task(_process(ctx, body, signature))
+    try:
+        await ctx.store.enqueue_relay(body, signature)
+    except Exception:
+        logger.exception("no pude persistir el webhook — pido reintento a Meta")
+        return JSONResponse({"error": "persistencia no disponible"}, status_code=503)
+    ctx.relay_wake.set()
+
+    task = asyncio.create_task(_process(ctx, body))
     _bg_tasks.add(task)
     task.add_done_callback(_bg_tasks.discard)
     return {"status": "ok"}
 
 
-async def _process(ctx: AppContext, body: bytes, signature: str | None) -> None:
-    # 1) Relay primero: el CRM recibe el payload crudo pase lo que pase.
-    try:
-        await ctx.store.enqueue_relay(body, signature)
-        ctx.relay_wake.set()
-    except Exception:
-        logger.exception("no pude encolar el relay — se pierde este payload")
-
-    # 2) Parseo tolerante + dedup + coalesce.
+async def _process(ctx: AppContext, body: bytes) -> None:
+    # El body firmado ya está durable en relay_queue antes del 200.
+    # Parseo tolerante + dedup + coalesce.
     try:
         payload = json.loads(body)
     except (ValueError, UnicodeDecodeError):

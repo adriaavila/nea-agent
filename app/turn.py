@@ -66,6 +66,8 @@ async def run_turn(
     ctx: AppContext, identity: str, inbound: list[InboundMessage]
 ) -> None:
     settings = ctx.settings
+    conv = await ctx.store.get_or_create_conversation(identity)
+    await ctx.store.abandon_pending_sends(conv.id)
 
     # --- Gate 1: contexto + allowlist administrada por el CRM -------------
     context = await _fetch_context(ctx, identity)
@@ -78,8 +80,6 @@ async def run_turn(
             "allowlist: %s no autorizado — relay sí, respuesta no", identity
         )
         return
-
-    conv = await ctx.store.get_or_create_conversation(identity)
 
     # --- Comando /reset (líneas de prueba) --------------------------------
     # Corre ANTES de los gates de aiEnabled/ventana: un reset también debe

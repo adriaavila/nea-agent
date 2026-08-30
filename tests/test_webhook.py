@@ -195,6 +195,30 @@ async def test_post_sin_secret_no_exige_firma(ctx, client, respx_mock):
     assert resp.status_code == 200
 
 
+async def test_post_pide_reintento_si_no_puede_persistir(ctx, client, monkeypatch):
+    async def db_down(body, signature):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(ctx.store, "enqueue_relay", db_down)
+    resp = await client.post("/webhook", content=wa_body())
+    assert resp.status_code == 503
+
+
+async def test_arranque_persistente_exige_firma_de_meta(monkeypatch):
+    from app import main
+
+    monkeypatch.setattr(
+        main,
+        "Settings",
+        lambda: make_settings(database_url="postgresql://db/nea", meta_app_secret=""),
+    )
+    app = main.create_app()
+
+    with pytest.raises(RuntimeError, match="META_APP_SECRET"):
+        async with app.router.lifespan_context(app):
+            pass
+
+
 # ---------------------------------------------------------------- dedup ---
 
 

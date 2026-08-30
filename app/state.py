@@ -155,6 +155,7 @@ class Store(Protocol):
         self, conversation_id: int, crm_conversation_id: str, content: str
     ) -> int: ...
     async def due_pending_sends(self, now: datetime) -> list[PendingSend]: ...
+    async def abandon_pending_sends(self, conversation_id: int) -> None: ...
     async def mark_pending_send_delivered(self, pending_id: int) -> None: ...
     async def mark_pending_send_abandoned(self, pending_id: int) -> None: ...
     async def reschedule_pending_send(
@@ -301,6 +302,16 @@ class MemoryStore:
             if p.delivered_at is None and p.abandoned_at is None
             and p.next_retry_at <= now
         ]
+
+    async def abandon_pending_sends(self, conversation_id: int) -> None:
+        now = utcnow()
+        for item in self.pending_sends.values():
+            if (
+                item.conversation_id == conversation_id
+                and item.delivered_at is None
+                and item.abandoned_at is None
+            ):
+                item.abandoned_at = now
 
     async def mark_pending_send_delivered(self, pending_id: int) -> None:
         self.pending_sends[pending_id].delivered_at = utcnow()

@@ -6,7 +6,8 @@ import json
 
 from app.llm import LlmExhausted, LlmReply, ToolCall
 from app.profile import BusinessProfile
-from tests.conftest import mock_crm_basics, wa_body
+from app.sender import SenderWorker
+from tests.conftest import CRM_CONV_ID, IDENTITY, mock_crm_basics, wa_body
 
 
 class ActivationProfile:
@@ -82,6 +83,25 @@ async def test_turno_programa_seguimiento(ctx, client, respx_mock):
     conv = next(iter(ctx.store.conversations.values()))
     assert conv.greeted is True
     assert conv.followup_due_at is not None  # empujón agendado a FOLLOWUP_HOURS
+
+
+async def test_mensaje_nuevo_descarta_respuesta_pendiente_vieja(
+    ctx, client, respx_mock
+):
+    routes = mock_crm_basics(respx_mock)
+    conv = await ctx.store.get_or_create_conversation(IDENTITY)
+    pending_id = await ctx.store.enqueue_pending_send(
+        conv.id, CRM_CONV_ID, "respuesta vieja"
+    )
+
+    await client.post(
+        "/webhook", content=wa_body(text="pregunta nueva", wamid="wamid.new")
+    )
+    await asyncio.sleep(0.2)
+    await SenderWorker(ctx).tick()
+
+    assert ctx.store.pending_sends[pending_id].abandoned_at is not None
+    assert routes["messages"].call_count == 1
 
 
 async def test_turno_con_route_out_cierra_sin_seguimiento(ctx, client, respx_mock):

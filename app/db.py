@@ -312,6 +312,17 @@ class PgStore:
             for r in rows
         ]
 
+    async def abandon_pending_sends(self, conversation_id: int) -> None:
+        await self.pool.execute(
+            """
+            UPDATE pending_send SET abandoned_at = now()
+            WHERE conversation_id = $1
+              AND delivered_at IS NULL
+              AND abandoned_at IS NULL
+            """,
+            conversation_id,
+        )
+
     async def mark_pending_send_delivered(self, pending_id: int) -> None:
         await self.pool.execute(
             "UPDATE pending_send SET delivered_at = now() WHERE id = $1", pending_id

@@ -52,6 +52,10 @@ def create_app(ctx: AppContext | None = None) -> FastAPI:
         own_resources = app.state.ctx is None
         if own_resources:
             settings = Settings()
+            if settings.database_url and not settings.meta_app_secret:
+                raise RuntimeError(
+                    "META_APP_SECRET es obligatorio con persistencia habilitada"
+                )
             store = PgStore(settings.database_url)
             await store.connect()
             await store.migrate(MIGRATIONS_DIR)
