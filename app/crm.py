@@ -6,8 +6,12 @@ Endpoints:
   POST /api/bot/messages   {conversationId, text}   → 409 ai_paused|window_closed
   PUT  /api/bot/ficha      {conversationId, ficha}
   POST /api/bot/handoff    {conversationId, reason}
-  GET  /api/bot/availability?limit=6
-  POST /api/bot/bookings   {conversationId, startUtc} → 409 slot_taken + slots frescos
+  GET  /api/bot/availability?conversationId=...&limit=&perDay=&days=
+       → {slots, diasConAgenda}. REGISTRA la oferta: sin esta llamada el CRM
+         rechaza cualquier reserva. 404 = esta instancia no tiene agenda.
+  POST /api/bot/bookings   {conversationId, startUtc} → 201; 409 slot_taken |
+       slot_not_offered, con `slots` frescos al lado del sobre de error
+  PATCH /api/bot/bookings  {conversationId, startUtc} → 200, mueve la cita
   GET  /api/bot/media/{mediaId}                       → binario + content-type
   POST /api/bot/reset      {conversationId}           → reinicio de pruebas (002)
 """
@@ -34,19 +38,39 @@ class CrmConflict(CrmError):
         self.payload = payload or {}
 
 
+class AgendaUnavailable(CrmError):
+    """Esta instancia del CRM no tiene agenda encendida (bandera AGENDA)."""
+
+
 class SlotTaken(CrmConflict):
     """El slot se ocupó entre oferta y confirmación; trae alternativas frescas."""
 
-    def __init__(self, payload: dict[str, Any] | None = None) -> None:
-        super().__init__("slot_taken", payload)
+    def __init__(
+        self, payload: dict[str, Any] | None = None, code: str = "slot_taken"
+    ) -> None:
+        super().__init__(code, payload)
         self.slots: list[dict[str, Any]] = list((payload or {}).get("slots") or [])
 
 
 def _conflict_code(response: httpx.Response) -> str:
+    """
+    El código del 409, venga en el sobre plano o en el anidado.
+
+    Vocero pasó de `{"code": "..."}` a `{"error": {"code": "..."}}` con `slots`
+    de hermano. Se leen los dos: un cliente que solo entendiera uno se queda
+    sin la rama de re-oferta y el lead ve al agente insistir con un horario
+    ocupado.
+    """
     try:
-        return str(response.json().get("code") or "conflict")
+        payload = response.json()
     except Exception:
         return "conflict"
+    if not isinstance(payload, dict):
+        return "conflict"
+    anidado = payload.get("error")
+    if isinstance(anidado, dict) and anidado.get("code"):
+        return str(anidado["code"])
+    return str(payload.get("code") or "conflict")
 
 
 # Catálogo cerrado del CRM para handoff.reason (006). El LLM escribe motivos
@@ -150,14 +174,47 @@ class CrmClient:
         if resp.status_code != 200:
             raise CrmError(f"handoff devolvió {resp.status_code}")
 
-    async def get_availability(self, limit: int = 6) -> list[dict[str, Any]]:
+    async def get_availability(
+        self,
+        conversation_id: str,
+        *,
+        limit: int = 12,
+        per_day: int = 3,
+        days: int = 5,
+    ) -> dict[str, Any]:
+        """
+        Los horarios que se le van a ofrecer al lead, Y su registro en el CRM.
+
+        `conversationId` es obligatorio y no es burocracia: el CRM guarda lo que
+        devuelve como "lo ofrecido a esta conversación", y `POST /bookings`
+        rechaza cualquier instante que no esté en esa lista. Sin pasar por aquí,
+        reservar es imposible.
+
+        Se piden MÁS de los que se enseñan (12 reservables, 3 por día): si el
+        lead pide "mejor el jueves", el agente tiene alternativas legítimas que
+        aceptar en vez de tener que re-ofrecer.
+        """
         resp = await self._request(
-            "GET", "/api/bot/availability", params={"limit": limit}
+            "GET",
+            "/api/bot/availability",
+            params={
+                "conversationId": conversation_id,
+                "limit": limit,
+                "perDay": per_day,
+                "days": days,
+            },
         )
+        if resp.status_code == 404:
+            raise AgendaUnavailable("la instancia no tiene agenda encendida")
         if resp.status_code != 200:
             raise CrmError(f"availability devolvió {resp.status_code}")
-        slots = resp.json().get("slots") or []
-        return list(slots)
+        data = resp.json()
+        return {
+            "slots": list(data.get("slots") or []),
+            # Los días que NO están aquí no tienen agenda. Es lo que evita que
+            # el modelo prometa un jueves que el negocio tiene cerrado.
+            "dias_con_agenda": list(data.get("diasConAgenda") or []),
+        }
 
     async def create_booking(
         self, conversation_id: str, start_utc: str
@@ -167,15 +224,41 @@ class CrmClient:
             "/api/bot/bookings",
             json={"conversationId": conversation_id, "startUtc": start_utc},
         )
+        return self._booking_response(resp)
+
+    async def reschedule_booking(
+        self, conversation_id: str, start_utc: str
+    ) -> dict[str, Any]:
+        """
+        Mueve la cita viva de esta conversación a otro horario ofrecido.
+
+        PATCH y 200, no POST y 201: mover no crea nada. Los mismos 409 que
+        crear, así que comparte el manejo.
+        """
+        resp = await self._request(
+            "PATCH",
+            "/api/bot/bookings",
+            json={"conversationId": conversation_id, "startUtc": start_utc},
+        )
+        return self._booking_response(resp)
+
+    @staticmethod
+    def _booking_response(resp: httpx.Response) -> dict[str, Any]:
+        if resp.status_code == 404:
+            raise AgendaUnavailable("la instancia no tiene agenda encendida")
         if resp.status_code == 409:
             payload: dict[str, Any] = {}
             try:
                 payload = resp.json()
             except Exception:
                 pass
-            if payload.get("code") == "slot_taken":
-                raise SlotTaken(payload)
-            raise CrmConflict(_conflict_code(resp), payload)
+            code = _conflict_code(resp)
+            # `slot_not_offered` se trata como `slot_taken`: en los dos casos la
+            # salida es la misma —re-ofrecer con datos reales— y el CRM manda
+            # los horarios frescos en el mismo sobre.
+            if code in ("slot_taken", "slot_not_offered"):
+                raise SlotTaken(payload, code=code)
+            raise CrmConflict(code, payload)
         # El CRM real responde 201 Created (REST); los mocks viejos daban 200.
         if resp.status_code not in (200, 201):
             raise CrmError(f"bookings devolvió {resp.status_code}")

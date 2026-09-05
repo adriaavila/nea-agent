@@ -11,7 +11,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
-from app.crm import CrmError, SlotTaken
+from app.crm import AgendaUnavailable, CrmError, SlotTaken
 from app.profile import BusinessProfile
 from app.state import AppContext, Conversation, OfferedSlot
 
@@ -77,6 +77,28 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "start_utc": {
                         "type": "string",
                         "description": "ISO 8601 UTC del slot elegido, tal cual se ofreció",
+                    }
+                },
+                "required": ["start_utc"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "reschedule_session",
+            "description": (
+                "Mueve la cita YA agendada de este lead a otro horario. Úsala "
+                "solo cuando el lead pide cambiar una cita que ya tiene. Igual "
+                "que book_session, start_utc debe ser de un slot que ofreciste "
+                "en esta conversación: llama antes a propose_slots."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "start_utc": {
+                        "type": "string",
+                        "description": "ISO 8601 UTC del nuevo slot, tal cual se ofreció",
                     }
                 },
                 "required": ["start_utc"],
@@ -185,6 +207,8 @@ class ToolRuntime:
                 return await self._propose_slots()
             if name == "book_session":
                 return await self._book_session(args)
+            if name == "reschedule_session":
+                return await self._book_session(args, mover=True)
             if name == "route_out":
                 return await self._route_out()
             if name == "handoff":
@@ -208,8 +232,17 @@ class ToolRuntime:
         return {"ok": True}
 
     async def _propose_slots(self) -> dict[str, Any]:
-        raw = await self._ctx.crm.get_availability(limit=6)
-        slots = _slots_from_payload(self._conv.id, raw)
+        try:
+            payload = await self._ctx.crm.get_availability(self._crm_conv_id)
+        except AgendaUnavailable:
+            # El CRM de este cliente no tiene agenda: no es un fallo, es que
+            # aquí no se agenda. El agente coordina con un humano.
+            return {
+                "ok": False,
+                "error": "sin_agenda",
+                "detalle": "esta instancia no agenda; usa handoff para coordinar directo",
+            }
+        slots = _slots_from_payload(self._conv.id, payload["slots"])
         if not slots:
             return {
                 "ok": False,
@@ -221,10 +254,26 @@ class ToolRuntime:
         return {
             "ok": True,
             "slots": _slots_for_llm(slots),
-            "instrucciones": "ofrece estos horarios con su etiqueta tal cual; máximo 3",
+            # El CRM ya registró estos horarios como "lo ofrecido"; el catálogo
+            # es más ancho que el menú a propósito (ver crm.get_availability).
+            "dias_con_agenda": payload["dias_con_agenda"],
+            "instrucciones": (
+                "ofrece MÁXIMO 3 con su etiqueta tal cual. Si el lead pide otro "
+                "día, mira dias_con_agenda: un día que no esté ahí, el negocio "
+                "lo tiene cerrado — dilo, no lo prometas."
+            ),
         }
 
-    async def _book_session(self, args: dict[str, Any]) -> dict[str, Any]:
+    async def _book_session(
+        self, args: dict[str, Any], *, mover: bool = False
+    ) -> dict[str, Any]:
+        """
+        Reserva (`mover=False`) o mueve (`mover=True`) la cita.
+
+        Es el mismo camino a propósito: las dos operaciones tienen las mismas
+        reglas —solo un horario ofrecido, y el hueco tiene que seguir libre— y
+        los mismos 409. Duplicarlo sería duplicar también los errores.
+        """
         wanted = _parse_utc(str(args.get("start_utc") or ""))
         offered = await self._ctx.store.get_offered_slots(self._conv.id)
         if wanted is None:
@@ -250,35 +299,59 @@ class ToolRuntime:
                 "slots_ofrecidos": _slots_for_llm(offered),
             }
         try:
-            result = await self._ctx.crm.create_booking(
-                self._crm_conv_id, _iso_z(chosen.start_utc)
+            result = await (
+                self._ctx.crm.reschedule_booking(
+                    self._crm_conv_id, _iso_z(chosen.start_utc)
+                )
+                if mover
+                else self._ctx.crm.create_booking(
+                    self._crm_conv_id, _iso_z(chosen.start_utc)
+                )
             )
+        except AgendaUnavailable:
+            return {
+                "ok": False,
+                "error": "sin_agenda",
+                "detalle": "esta instancia no agenda; usa handoff para coordinar directo",
+            }
         except SlotTaken as exc:
-            # El slot se ocupó entre oferta y elección: alternativas frescas.
+            # Se ocupó entre oferta y elección, o el CRM no reconoce el
+            # instante como ofrecido. Misma salida: alternativas frescas del
+            # propio CRM, nunca discutir con el lead.
             fresh = _slots_from_payload(self._conv.id, exc.slots)
             await self._ctx.store.replace_offered_slots(self._conv.id, fresh)
             return {
                 "ok": False,
-                "error": "slot_taken",
-                "detalle": "ese horario se acaba de ocupar; discúlpate breve y ofrece estas alternativas",
+                "error": exc.code,
+                "detalle": (
+                    "ese horario se acaba de ocupar; discúlpate breve y ofrece estas alternativas"
+                    if exc.code == "slot_taken"
+                    else "ese horario no está entre los que ofreciste; ofrece estos"
+                ),
                 "slots": _slots_for_llm(fresh),
             }
         await self._ctx.store.clear_offered_slots(self._conv.id)
         self.booked = True
-        try:
-            await self._ctx.crm.put_ficha(
-                self._crm_conv_id, {"calificado": True, "resultado": "agendo"}
-            )
-        except CrmError as exc:  # best-effort: la cita ya existe
-            logger.warning("tools: no pude actualizar ficha tras booking: %s", exc)
+        if not mover:
+            try:
+                await self._ctx.crm.put_ficha(
+                    self._crm_conv_id, {"calificado": True, "resultado": "agendo"}
+                )
+            except CrmError as exc:  # best-effort: la cita ya existe
+                logger.warning("tools: no pude actualizar ficha tras booking: %s", exc)
         return {
             "ok": True,
             "label": result.get("label") or chosen.label,
-            "zoom_url": result.get("zoomJoinUrl"),
+            # `meetingLink` es el nombre del CRM desde el motor de agenda
+            # universal; `zoomJoinUrl` era del conector único de antes.
+            "meeting_url": result.get("meetingLink") or result.get("zoomJoinUrl"),
+            "link_pendiente": bool(result.get("linkPending")),
+            "movida": mover,
             "instrucciones": (
-                "confirma día y hora de la cita, comparte el link de la "
-                "videollamada si existe y menciona lo que el negocio pida "
-                "para llegar preparado"
+                "confirma día y hora de la cita y menciona lo que el negocio "
+                "pida para llegar preparado. Si hay meeting_url, compártelo. Si "
+                "link_pendiente es true, la cita EXISTE pero el enlace todavía "
+                "no: di que se lo mandas en un momento — nunca inventes uno."
             ),
         }
 

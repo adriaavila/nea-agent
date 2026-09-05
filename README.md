@@ -57,8 +57,33 @@ Meta Cloud API ── webhook ──► Nea (este repo)
 ```
 
 Herramientas del LLM: `update_ficha` (calificación), `propose_slots` /
-`book_session` (agenda), `route_out` (no califica; comparte los recursos
-alternativos del perfil), `handoff` (pausa la IA en el CRM).
+`book_session` / `reschedule_session` (agenda), `route_out` (no califica;
+comparte los recursos alternativos del perfil), `handoff` (pausa la IA en el
+CRM).
+
+### La agenda, contra el motor universal del CRM (Vocero 015)
+
+`propose_slots` no solo consulta: **registra**. `GET /api/bot/availability`
+guarda en el CRM lo que devuelve como "lo ofrecido a esta conversación", y
+`POST /api/bot/bookings` rechaza con 409 cualquier instante que no esté en esa
+lista. La regla es del servidor, no del prompt: el LLM no puede agendar un
+horario inventado ni aunque lo intente.
+
+Consecuencias prácticas al integrar:
+
+| | |
+|---|---|
+| `conversationId` | Obligatorio en `availability`. Sin él, 422. |
+| Catálogo vs. menú | Se piden 12 reservables y se le enseñan 3 al lead. Si pide otro día, el agente tiene alternativas legítimas sin re-ofrecer. |
+| `diasConAgenda` | Los días que NO vienen ahí están cerrados. Evita el "déjame ver si te consigo el sábado". |
+| Crear | **201**, no 200. |
+| Mover | `PATCH` y 200. Cancelar no existe por esta puerta: es handoff. |
+| Error 409 | Anidado: `{"error":{"code":…}}` con `slots` de HERMANO. `slot_taken` y `slot_not_offered` se resuelven igual: re-ofrecer con los `slots` que vienen. |
+| `linkPending` | La cita existe y el enlace todavía no. Se confirma la cita y se dice que el enlace llega luego — nunca se inventa uno. |
+| Sin agenda | La agenda es opcional en Vocero (bandera `AGENDA`). Apagada, toda la superficie es 404 y Nea coordina por handoff en vez de romperse. |
+
+El contrato está clavado en `tests/test_agenda_contrato.py`: si Vocero lo
+cambia, ahí se rompe primero.
 
 ## Quickstart
 
