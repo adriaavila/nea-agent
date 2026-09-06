@@ -45,13 +45,36 @@ def _activation_matches(profile: Any, inbound: list[InboundMessage]) -> bool:
     )
 
 
-def _agent_tz(settings: Any) -> ZoneInfo:
-    try:
-        return ZoneInfo(getattr(settings, "agent_timezone", "") or "America/Mexico_City")
-    except Exception:
-        logger.warning("AGENT_TIMEZONE inválida %r — uso America/Mexico_City",
-                       getattr(settings, "agent_timezone", None))
-        return ZoneInfo("America/Mexico_City")
+#: Último recurso, y solo eso. Cablear la zona es como se rompe el
+#: agendamiento sin que nada falle: el bot dice "mañana a las 3" en una zona y
+#: el motor del CRM reserva en otra.
+_TZ_ULTIMO_RECURSO = "America/Mexico_City"
+
+
+def _agent_tz(settings: Any, profile: Any = None) -> ZoneInfo:
+    """La zona en la que el agente PIENSA las fechas.
+
+    Orden: la del negocio (la sirve el CRM y es la que etiqueta los huecos) →
+    AGENT_TIMEZONE del despliegue → último recurso.
+
+    El primer escalón importa: sin él, un negocio en Caracas con un bot que
+    asume Ciudad de México ofrece horarios con una hora de desfase, y el lead
+    llega tarde o temprano a su propia cita.
+    """
+    candidatos = [
+        getattr(profile, "timezone", None),
+        getattr(settings, "agent_timezone", None),
+        _TZ_ULTIMO_RECURSO,
+    ]
+    for candidato in candidatos:
+        nombre = (candidato or "").strip()
+        if not nombre:
+            continue
+        try:
+            return ZoneInfo(nombre)
+        except Exception:
+            logger.warning("zona horaria inválida %r — sigo con la siguiente", nombre)
+    return ZoneInfo(_TZ_ULTIMO_RECURSO)
 
 
 async def handle_flush(ctx: AppContext, identity: str, items: list[Any]) -> None:
@@ -161,7 +184,7 @@ async def run_turn(
         conv=conv,
         referral_headline=referral,
         offered=offered,
-        tz=_agent_tz(settings),
+        tz=_agent_tz(settings, profile),
     )
     history = await ctx.store.recent_messages(conv.id, settings.history_window)
     messages: list[dict[str, Any]] = [{"role": "system", "content": system}] + [

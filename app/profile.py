@@ -48,6 +48,10 @@ class BusinessProfile:
     resources: list[dict[str, str]] = field(default_factory=list)
     activation_enabled: bool = False
     activation_messages: tuple[str, ...] = ()
+    #: Zona horaria del negocio, tal como la sirve el CRM (`calendar_settings`).
+    #: Es la MISMA con la que el motor de agenda etiqueta los huecos. `None`
+    #: significa "el CRM no la dijo" y manda entonces AGENT_TIMEZONE.
+    timezone: str | None = None
 
     @property
     def has_knowledge(self) -> bool:
@@ -81,6 +85,9 @@ def profile_from_payload(payload: dict[str, Any], default_name: str) -> Business
         resources=resources,
         activation_enabled=bool(prof.get("activationEnabled")),
         activation_messages=activation_messages,
+        timezone=(str(prof.get("timezone")).strip() or None)
+        if prof.get("timezone")
+        else None,
     )
 
 

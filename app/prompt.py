@@ -106,8 +106,31 @@ def _business_block(profile: BusinessProfile) -> str:
     return "\n\n".join(lines)
 
 
+#: Días y meses escritos aquí y no con `%A`/`%B`.
+#:
+#: `strftime` traduce según el locale del PROCESO, y la imagen no fija ninguno:
+#: en el contenedor sale el locale C y el prompt decía "Thursday 05 de March"
+#: dentro de un texto en español. El modelo tenía entonces tres vocabularios
+#: para un mismo día — "Thursday" en su contexto, "jueves" del cliente,
+#: "jueves" en las etiquetas del CRM — y elegía mal. Esto no depende del
+#: entorno y dice lo mismo en cualquier máquina.
+_DIAS = (
+    "lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo",
+)
+_MESES = (
+    "enero", "febrero", "marzo", "abril", "mayo", "junio",
+    "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre",
+)
+
+
 def _fmt_local(dt: datetime, tz: ZoneInfo) -> str:
-    return dt.astimezone(tz).strftime("%A %d de %B, %H:%M") + f" ({tz.key})"
+    local = dt.astimezone(tz)
+    dia = _DIAS[local.weekday()]
+    mes = _MESES[local.month - 1]
+    return (
+        f"{dia} {local.day} de {mes} de {local.year}, "
+        f"{local.strftime('%H:%M')} ({tz.key})"
+    )
 
 
 def build_system_prompt(
