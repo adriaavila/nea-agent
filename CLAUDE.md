@@ -21,6 +21,7 @@ idempotentes al arranque · httpx (CRM y OpenAI) · pytest + respx · Docker
 | El contrato con el CRM | `app/crm.py` (espejo del bot gateway de vocero) |
 | Webhook/firma/dedup/relay | `app/webhook.py` · `app/relay.py` |
 | Coalesce y seguimiento | `app/coalesce.py` · `app/followup.py` |
+| Despacho multi-organización (Vocero multitenant) | `app/dispatch.py` · `app/multiorg.py` |
 | Tablas | `migrations/*.sql` (idempotentes, aplican al boot) |
 
 ## Reglas duras

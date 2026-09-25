@@ -2,7 +2,7 @@
 
 Endpoints:
   GET  /api/bot/profile                               → agent profile + KB (404 = sin perfil)
-  GET  /api/bot/context?waIdentity=...
+  GET  /api/bot/context?waIdentity=...  o  ?conversationId=...  (modo despacho)
   POST /api/bot/messages   {conversationId, text}   → 409 ai_paused|window_closed
   PUT  /api/bot/ficha      {conversationId, ficha}
   POST /api/bot/handoff    {conversationId, reason}
@@ -100,10 +100,20 @@ class CrmClient:
         api_key: str,
         timeout: float = 15.0,
         client: httpx.AsyncClient | None = None,
+        organization_id: str | None = None,
     ) -> None:
+        """`organization_id` arma un cliente para el modo de despacho
+        multi-organización: cada llamada a /api/bot/* lleva el header
+        `X-Organization-Id` además del `X-API-Key` de siempre — es lo que le
+        deja al CRM enrutar la petición a la organización correcta. `None`
+        (default) es el camino legacy de un solo negocio: sin ese header."""
+        self.organization_id = organization_id
+        headers = {"X-API-Key": api_key}
+        if organization_id:
+            headers["X-Organization-Id"] = organization_id
         self._http = client or httpx.AsyncClient(
             base_url=base_url.rstrip("/"),
-            headers={"X-API-Key": api_key},
+            headers=headers,
             timeout=timeout,
         )
 
@@ -113,11 +123,24 @@ class CrmClient:
         except httpx.HTTPError as exc:
             raise CrmError(f"error de red hacia el CRM: {exc}") from exc
 
-    async def get_context(self, wa_identity: str) -> dict[str, Any] | None:
-        """Contexto conversacional; None si el CRM aún no conoce la identidad (404)."""
-        resp = await self._request(
-            "GET", "/api/bot/context", params={"waIdentity": wa_identity}
-        )
+    async def get_context(
+        self, wa_identity: str | None = None, *, conversation_id: str | None = None
+    ) -> dict[str, Any] | None:
+        """Contexto conversacional; None si el CRM aún no conoce la identidad
+        o la conversación (404).
+
+        Dos caminos: `waIdentity` (webhook clásico) o `conversationId` (modo
+        despacho — el CRM ya conoce la conversación de antemano, y las
+        conversaciones de prueba del Laboratorio no tienen una identidad real
+        que buscar; `conversation_id`, si se pasa, siempre gana).
+        """
+        if conversation_id is not None:
+            params = {"conversationId": conversation_id}
+        elif wa_identity is not None:
+            params = {"waIdentity": wa_identity}
+        else:
+            raise ValueError("get_context necesita wa_identity o conversation_id")
+        resp = await self._request("GET", "/api/bot/context", params=params)
         if resp.status_code == 404:
             return None
         if resp.status_code != 200:

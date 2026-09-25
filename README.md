@@ -61,6 +61,30 @@ Herramientas del LLM: `update_ficha` (calificación), `propose_slots` /
 comparte los recursos alternativos del perfil), `handoff` (pausa la IA en el
 CRM).
 
+### Modo de despacho multi-organización (Vocero multitenant)
+
+Con un Vocero multitenant, el camino se invierte: el CRM recibe el webhook de
+Meta de TODAS sus organizaciones, lo guarda, hace su propio debounce, y le
+despacha el turno ya armado a una Nea COMPARTIDA:
+
+```
+Meta Cloud API ── webhook ──► Vocero CRM (multitenant)
+                               │  guarda, debounce
+                               └─ POST {NEA}/dispatch (firmado, síncrono) ──► Nea
+                                  │  X-Organization-Id en cada /api/bot/* de vuelta
+                                  └─ envía vía POST {CRM}/api/bot/messages
+```
+
+`POST /dispatch` se monta SIEMPRE junto al webhook de Meta de siempre — no hay
+bandera de modo, y `organization_id` NULL es exactamente el camino legacy de
+un solo negocio (así siguen funcionando despliegues de un solo negocio como
+nea-santorini, sin tocar nada). Cada organización tiene su propio
+`CrmClient`/`BusinessProfile` cacheados (`app/multiorg.py`): el perfil de una
+JAMÁS se sirve a otra. Sin coalesce (el CRM ya agrupó la ráfaga) y sin relay
+(el CRM ya tiene el mensaje) — el turno corre síncrono dentro del request y
+responde 200 solo al terminar (5xx si revienta, para que el CRM reintente el
+job). Detalle completo: `app/dispatch.py` y `.env.example`.
+
 ### La agenda, contra el motor universal del CRM (Vocero 015)
 
 `propose_slots` no solo consulta: **registra**. `GET /api/bot/availability`

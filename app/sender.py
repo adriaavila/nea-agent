@@ -14,6 +14,7 @@ import logging
 from datetime import datetime, timedelta
 
 from app.crm import CrmConflict, CrmError
+from app.multiorg import scoped_ctx
 from app.state import AppContext, PendingSend, utcnow
 
 logger = logging.getLogger("nea.sender")
@@ -45,12 +46,16 @@ class SenderWorker:
                     item.id,
                 )
                 await self._ctx.store.mark_pending_send_abandoned(item.id)
-                await self._handoff(item.crm_conversation_id)
+                await self._handoff(item.crm_conversation_id, item.organization_id)
                 continue
             await self._attempt(item, now)
 
     async def _attempt(self, item: PendingSend, now: datetime) -> None:
-        ctx = self._ctx
+        # organization_id viaja con el pending_send desde app/turn.py: sin
+        # esto, un reintento diferido de una organización cualquiera saldría
+        # con el CrmClient global (o peor, con el header de OTRA organización
+        # si el worker reutilizara el último ctx armado).
+        ctx = scoped_ctx(self._ctx, item.organization_id)
         try:
             await ctx.crm.send_message(item.crm_conversation_id, item.content)
         except CrmConflict as exc:
@@ -81,8 +86,11 @@ class SenderWorker:
         await ctx.store.add_message(item.conversation_id, "assistant", item.content)
         logger.info("sender: pending %d entregado", item.id)
 
-    async def _handoff(self, crm_conv_id: str) -> None:
+    async def _handoff(
+        self, crm_conv_id: str, organization_id: str | None = None
+    ) -> None:
+        ctx = scoped_ctx(self._ctx, organization_id)
         try:
-            await self._ctx.crm.post_handoff(crm_conv_id, "error")
+            await ctx.crm.post_handoff(crm_conv_id, "error")
         except CrmError as exc:
             logger.error("sender: no pude registrar el handoff tras abandono: %s", exc)

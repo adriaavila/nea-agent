@@ -177,6 +177,18 @@ async def receive(request: Request) -> Any:
     """Persiste antes del 200; el resto corre en una tarea de fondo."""
     ctx: AppContext = request.app.state.ctx
     body = await request.body()
+    if ctx.settings.database_url and not ctx.settings.meta_app_secret:
+        # Despliegue de solo-despacho: arrancó sin META_APP_SECRET porque
+        # tiene CRM_BOT_API_KEY (ver el guard de app/main.py). Con
+        # persistencia real, un secreto vacío ya NO significa "dev, no
+        # verifiques" — significa que esta instancia no habla con Meta, y
+        # aceptar payloads sin firma aquí sería aceptar cualquier POST de
+        # cualquiera que conozca la URL.
+        logger.warning(
+            "webhook de Meta deshabilitado (sin META_APP_SECRET en despliegue "
+            "con persistencia) — 401"
+        )
+        return JSONResponse({"error": "webhook deshabilitado"}, status_code=401)
     signature = request.headers.get("x-hub-signature-256")
     if not verify_signature(body, signature, ctx.settings.meta_app_secret or None):
         logger.warning("firma inválida o ausente en el webhook — 401")

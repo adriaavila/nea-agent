@@ -39,6 +39,7 @@ def _conv_from_row(row: asyncpg.Record) -> Conversation:
         followup_due_at=row["followup_due_at"],
         followup_sent=row["followup_sent"],
         last_inbound_at=row["last_inbound_at"],
+        organization_id=row["organization_id"],
     )
 
 
@@ -136,14 +137,23 @@ class PgStore:
 
     # ----------------------------------------------------- conversaciones ---
 
-    async def get_or_create_conversation(self, wa_identity: str) -> Conversation:
+    async def get_or_create_conversation(
+        self, wa_identity: str, organization_id: str | None = None
+    ) -> Conversation:
+        # El arbitraje del ON CONFLICT usa la MISMA expresión que el índice
+        # único de la migración 003 (COALESCE(organization_id, '')): NULL no
+        # sirve como arbitraje porque en Postgres dos NULL nunca son iguales
+        # entre sí dentro de un índice único.
         row = await self.pool.fetchrow(
             """
-            INSERT INTO bot_conversation (wa_identity) VALUES ($1)
-            ON CONFLICT (wa_identity) DO UPDATE SET updated_at = now()
+            INSERT INTO bot_conversation (wa_identity, organization_id)
+            VALUES ($1, $2)
+            ON CONFLICT ((COALESCE(organization_id, '')), wa_identity)
+            DO UPDATE SET updated_at = now()
             RETURNING *
             """,
             wa_identity,
+            organization_id,
         )
         assert row is not None
         return _conv_from_row(row)
@@ -273,16 +283,22 @@ class PgStore:
     # ------------------------------------------------- envíos pendientes ---
 
     async def enqueue_pending_send(
-        self, conversation_id: int, crm_conversation_id: str, content: str
+        self,
+        conversation_id: int,
+        crm_conversation_id: str,
+        content: str,
+        organization_id: str | None = None,
     ) -> int:
         row = await self.pool.fetchrow(
             """
-            INSERT INTO pending_send (conversation_id, crm_conversation_id, content)
-            VALUES ($1, $2, $3) RETURNING id
+            INSERT INTO pending_send
+                (conversation_id, crm_conversation_id, content, organization_id)
+            VALUES ($1, $2, $3, $4) RETURNING id
             """,
             conversation_id,
             crm_conversation_id,
             content,
+            organization_id,
         )
         assert row is not None
         return row["id"]
@@ -308,6 +324,7 @@ class PgStore:
                 next_retry_at=r["next_retry_at"],
                 delivered_at=r["delivered_at"],
                 abandoned_at=r["abandoned_at"],
+                organization_id=r["organization_id"],
             )
             for r in rows
         ]

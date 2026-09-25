@@ -86,19 +86,40 @@ async def handle_flush(ctx: AppContext, identity: str, items: list[Any]) -> None
 
 
 async def run_turn(
-    ctx: AppContext, identity: str, inbound: list[InboundMessage]
+    ctx: AppContext,
+    identity: str,
+    inbound: list[InboundMessage],
+    *,
+    organization_id: str | None = None,
+    crm_conversation_id: str | None = None,
+    bypass_allowlist: bool = False,
 ) -> None:
+    """Corre un turno completo.
+
+    `organization_id`/`crm_conversation_id`/`bypass_allowlist` solo los usa el
+    modo de despacho multi-organización (app/dispatch.py): `ctx` ya viene con
+    el `crm`/`profile` de la organización correcta (app/multiorg.scoped_ctx),
+    `organization_id` se persiste en bot_conversation/pending_send para que
+    los workers de fondo sepan con quién hablar, `crm_conversation_id` evita
+    resolver el contexto por waIdentity (el CRM enruta por conversationId), y
+    `bypass_allowlist` deja pasar a las conversaciones de prueba del
+    Laboratorio aunque la organización tenga la allowlist encendida. El
+    camino legacy (webhook de Meta) no pasa ninguno — comportamiento idéntico
+    al de siempre.
+    """
     settings = ctx.settings
-    conv = await ctx.store.get_or_create_conversation(identity)
+    conv = await ctx.store.get_or_create_conversation(
+        identity, organization_id=organization_id
+    )
     await ctx.store.abandon_pending_sends(conv.id)
 
     # --- Gate 1: contexto + allowlist administrada por el CRM -------------
-    context = await _fetch_context(ctx, identity)
+    context = await _fetch_context(ctx, identity, crm_conversation_id=crm_conversation_id)
     if context is None:
         logger.warning("turno %s: sin contexto del CRM — silencio", identity)
         return
     restricted, allowed = access_policy(settings, context)
-    if restricted and canonical_identity(identity) not in allowed:
+    if restricted and not bypass_allowlist and canonical_identity(identity) not in allowed:
         logger.info(
             "allowlist: %s no autorizado — relay sí, respuesta no", identity
         )
@@ -107,10 +128,11 @@ async def run_turn(
     # --- Comando /reset (líneas de prueba) --------------------------------
     # Corre ANTES de los gates de aiEnabled/ventana: un reset también debe
     # sacar la conversación de un handoff activo.
-    if restricted and canonical_identity(identity) in allowed and any(
-        (m.text or "").strip().lower() in RESET_COMMANDS for m in inbound
+    if (
+        (bypass_allowlist or (restricted and canonical_identity(identity) in allowed))
+        and any((m.text or "").strip().lower() in RESET_COMMANDS for m in inbound)
     ):
-        await _run_reset(ctx, conv, identity)
+        await _run_reset(ctx, conv, identity, crm_conversation_id=crm_conversation_id)
         return
 
     # --- Gate 2: aiEnabled y ventana --------------------------------------
@@ -228,7 +250,13 @@ async def run_turn(
     # --- Enviar la respuesta (SIEMPRE vía el CRM, nunca Meta directo) -----
     sent = False
     if final_text and final_text.strip():
-        sent = await _send(ctx, conv.id, str(crm_conv_id), final_text.strip())
+        sent = await _send(
+            ctx,
+            conv.id,
+            str(crm_conv_id),
+            final_text.strip(),
+            organization_id=organization_id,
+        )
         if sent:
             await ctx.store.add_message(conv.id, "assistant", final_text.strip())
 
@@ -252,12 +280,17 @@ async def run_turn(
     await ctx.store.update_conversation(conv.id, **updates)
 
 
-async def _run_reset(ctx: AppContext, conv: Any, identity: str) -> None:
+async def _run_reset(
+    ctx: AppContext,
+    conv: Any,
+    identity: str,
+    crm_conversation_id: str | None = None,
+) -> None:
     """Reinicio de pruebas: CRM primero (ficha limpia + IA reactivada, para que
     la confirmación no rebote con 409 ai_paused) y luego la memoria local."""
-    crm_conv_id = conv.crm_conversation_id
+    crm_conv_id = conv.crm_conversation_id or crm_conversation_id
     if not crm_conv_id:
-        context = await _fetch_context(ctx, identity)
+        context = await _fetch_context(ctx, identity, crm_conversation_id=crm_conversation_id)
         crm_conv_id = ((context or {}).get("conversation") or {}).get("id")
     if crm_conv_id:
         try:
@@ -276,10 +309,14 @@ async def _run_reset(ctx: AppContext, conv: Any, identity: str) -> None:
         )
 
 
-async def _fetch_context(ctx: AppContext, identity: str) -> dict[str, Any] | None:
+async def _fetch_context(
+    ctx: AppContext, identity: str, *, crm_conversation_id: str | None = None
+) -> dict[str, Any] | None:
     for attempt in range(CONTEXT_ATTEMPTS):
         try:
-            context = await ctx.crm.get_context(identity)
+            context = await ctx.crm.get_context(
+                identity, conversation_id=crm_conversation_id
+            )
         except CrmError as exc:
             logger.warning(
                 "context de %s: error del CRM (intento %d): %s",
@@ -343,7 +380,13 @@ async def _tool_loop(
 SEND_ATTEMPTS = 4  # backoff 1 s, 2 s, 4 s entre intentos (~7 s en el turno)
 
 
-async def _send(ctx: AppContext, conv_id: int, crm_conv_id: str, text: str) -> bool:
+async def _send(
+    ctx: AppContext,
+    conv_id: int,
+    crm_conv_id: str,
+    text: str,
+    organization_id: str | None = None,
+) -> bool:
     """Envía vía el CRM. Si el turno agota sus reintentos, la respuesta NO se
     descarta: se encola en pending_send y el SenderWorker la reintenta con
     backoff hasta entregar o agotar 24 h (incidente 2026-08-03)."""
@@ -359,7 +402,9 @@ async def _send(ctx: AppContext, conv_id: int, crm_conv_id: str, text: str) -> b
             logger.warning("envío falló (intento %d): %s", attempt + 1, exc)
             if attempt < SEND_ATTEMPTS - 1:
                 await asyncio.sleep(2.0**attempt)
-    pending_id = await ctx.store.enqueue_pending_send(conv_id, crm_conv_id, text)
+    pending_id = await ctx.store.enqueue_pending_send(
+        conv_id, crm_conv_id, text, organization_id=organization_id
+    )
     logger.error(
         "envío agotó reintentos del turno — encolado como pending_send %d",
         pending_id,

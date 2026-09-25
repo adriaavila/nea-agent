@@ -204,19 +204,70 @@ async def test_post_pide_reintento_si_no_puede_persistir(ctx, client, monkeypatc
     assert resp.status_code == 503
 
 
-async def test_arranque_persistente_exige_firma_de_meta(monkeypatch):
+async def test_arranque_persistente_exige_firma_de_meta_o_api_key_del_crm(monkeypatch):
+    """Sin META_APP_SECRET NI CRM_BOT_API_KEY, un arranque con persistencia
+    real no puede hablar de forma segura ni con Meta (/webhook) ni con el CRM
+    en modo despacho (/dispatch) — el guard sigue exigiendo uno de los dos."""
     from app import main
 
     monkeypatch.setattr(
         main,
         "Settings",
-        lambda: make_settings(database_url="postgresql://db/nea", meta_app_secret=""),
+        lambda: make_settings(
+            database_url="postgresql://db/nea", meta_app_secret="", crm_bot_api_key=""
+        ),
     )
     app = main.create_app()
 
     with pytest.raises(RuntimeError, match="META_APP_SECRET"):
         async with app.router.lifespan_context(app):
             pass
+
+
+async def test_arranque_persistente_solo_despacho_no_exige_meta_app_secret(monkeypatch):
+    """Con CRM_BOT_API_KEY configurado, un despliegue de solo-despacho puede
+    arrancar sin META_APP_SECRET (no habla con Meta — solo con el CRM)."""
+    from app import main
+
+    monkeypatch.setattr(
+        main,
+        "Settings",
+        lambda: make_settings(
+            database_url="postgresql://db/nea", meta_app_secret="", crm_bot_api_key="k"
+        ),
+    )
+
+    class FakePgStore:
+        def __init__(self, dsn: str) -> None:
+            self.dsn = dsn
+
+        async def connect(self) -> None:
+            pass
+
+        async def migrate(self, migrations_dir) -> None:  # type: ignore[no-untyped-def]
+            pass
+
+        async def ping(self) -> None:
+            pass
+
+        async def aclose(self) -> None:
+            pass
+
+    monkeypatch.setattr(main, "PgStore", FakePgStore)
+
+    app = main.create_app()
+    async with app.router.lifespan_context(app):
+        pass  # no debe lanzar RuntimeError
+
+
+async def test_webhook_deshabilitado_en_despliegue_solo_despacho(ctx, client, monkeypatch):
+    """Con persistencia real y sin META_APP_SECRET (solo-despacho), el
+    webhook de Meta rechaza TODO en vez de aceptar payloads sin firma."""
+    ctx.settings.database_url = "postgresql://db/nea"
+    ctx.settings.meta_app_secret = ""
+
+    resp = await client.post("/webhook", content=wa_body())
+    assert resp.status_code == 401
 
 
 # ---------------------------------------------------------------- dedup ---

@@ -21,6 +21,7 @@ from app.coalesce import Coalescer
 from app.config import Settings
 from app.crm import CrmClient
 from app.db import PgStore
+from app.dispatch import router as dispatch_router
 from app.followup import FollowupWorker
 from app.llm import OpenAiLlm
 from app.profile import ProfileProvider
@@ -52,9 +53,15 @@ def create_app(ctx: AppContext | None = None) -> FastAPI:
         own_resources = app.state.ctx is None
         if own_resources:
             settings = Settings()
-            if settings.database_url and not settings.meta_app_secret:
+            if (
+                settings.database_url
+                and not settings.meta_app_secret
+                and not settings.crm_bot_api_key
+            ):
                 raise RuntimeError(
-                    "META_APP_SECRET es obligatorio con persistencia habilitada"
+                    "META_APP_SECRET es obligatorio con persistencia habilitada, "
+                    "salvo que CRM_BOT_API_KEY esté configurado (despliegue de "
+                    "solo-despacho: /webhook queda deshabilitado y solo corre /dispatch)"
                 )
             store = PgStore(settings.database_url)
             await store.connect()
@@ -111,6 +118,7 @@ def create_app(ctx: AppContext | None = None) -> FastAPI:
     if ctx is not None:
         _wire_coalescer(ctx)
     app.include_router(webhook_router)
+    app.include_router(dispatch_router)
 
     @app.get("/health")
     async def health(request: Request):  # type: ignore[no-untyped-def]

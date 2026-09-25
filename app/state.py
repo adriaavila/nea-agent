@@ -34,6 +34,11 @@ class Conversation:
     followup_due_at: datetime | None = None
     followup_sent: bool = False
     last_inbound_at: datetime | None = None
+    #: None = camino legacy de un solo negocio (webhook de Meta + relay). Con
+    #: valor, esta conversación vino del modo de despacho multi-organización:
+    #: FollowupWorker/SenderWorker la usan para hablarle al CRM con el
+    #: CrmClient de ESA organización, nunca el global.
+    organization_id: str | None = None
 
 
 @dataclass
@@ -81,6 +86,9 @@ class PendingSend:
     next_retry_at: datetime
     delivered_at: datetime | None = None
     abandoned_at: datetime | None = None
+    #: Misma semántica que Conversation.organization_id — el SenderWorker la
+    #: necesita para reintentar con el CrmClient correcto.
+    organization_id: str | None = None
 
 
 @dataclass
@@ -124,7 +132,13 @@ class Store(Protocol):
     ) -> None: ...
 
     # conversaciones
-    async def get_or_create_conversation(self, wa_identity: str) -> Conversation: ...
+    async def get_or_create_conversation(
+        self, wa_identity: str, organization_id: str | None = None
+    ) -> Conversation:
+        """`organization_id` None = namespace legacy de un solo negocio. Con
+        valor, la identidad se vuelve única por organización — la MISMA
+        identidad en dos organizaciones son dos conversaciones distintas."""
+        ...
     async def update_conversation(self, conversation_id: int, **fields: Any) -> None: ...
     async def reset_conversation(self, conversation_id: int) -> None:
         """Borra historial + slots y regresa la conversación a estado inicial
@@ -152,7 +166,11 @@ class Store(Protocol):
 
     # cola de envíos pendientes (respuestas que no pudieron salir en el turno)
     async def enqueue_pending_send(
-        self, conversation_id: int, crm_conversation_id: str, content: str
+        self,
+        conversation_id: int,
+        crm_conversation_id: str,
+        content: str,
+        organization_id: str | None = None,
     ) -> int: ...
     async def due_pending_sends(self, now: datetime) -> list[PendingSend]: ...
     async def abandon_pending_sends(self, conversation_id: int) -> None: ...
@@ -183,7 +201,9 @@ class MemoryStore:
         self.processed: set[str] = set()
         self.relays: dict[int, RelayItem] = {}
         self.conversations: dict[int, Conversation] = {}
-        self._conv_by_identity: dict[str, int] = {}
+        # Clave (organization_id o "", wa_identity): espeja el índice único de
+        # Postgres sobre (COALESCE(organization_id, ''), wa_identity).
+        self._conv_by_identity: dict[tuple[str, str], int] = {}
         self.messages: list[BotMessage] = []
         self.offered: dict[int, list[OfferedSlot]] = {}
         self.pending_sends: dict[int, PendingSend] = {}
@@ -223,14 +243,17 @@ class MemoryStore:
         item.attempts = attempts
         item.next_retry_at = next_retry_at
 
-    async def get_or_create_conversation(self, wa_identity: str) -> Conversation:
-        cid = self._conv_by_identity.get(wa_identity)
+    async def get_or_create_conversation(
+        self, wa_identity: str, organization_id: str | None = None
+    ) -> Conversation:
+        key = (organization_id or "", wa_identity)
+        cid = self._conv_by_identity.get(key)
         if cid is not None:
             return self.conversations[cid]
         cid = next(self._ids)
-        conv = Conversation(id=cid, wa_identity=wa_identity)
+        conv = Conversation(id=cid, wa_identity=wa_identity, organization_id=organization_id)
         self.conversations[cid] = conv
-        self._conv_by_identity[wa_identity] = cid
+        self._conv_by_identity[key] = cid
         return conv
 
     async def update_conversation(self, conversation_id: int, **fields: Any) -> None:
@@ -285,7 +308,11 @@ class MemoryStore:
         self.offered.pop(conversation_id, None)
 
     async def enqueue_pending_send(
-        self, conversation_id: int, crm_conversation_id: str, content: str
+        self,
+        conversation_id: int,
+        crm_conversation_id: str,
+        content: str,
+        organization_id: str | None = None,
     ) -> int:
         pid = next(self._ids)
         now = utcnow()
@@ -293,6 +320,7 @@ class MemoryStore:
             id=pid, conversation_id=conversation_id,
             crm_conversation_id=crm_conversation_id, content=content,
             attempts=0, created_at=now, next_retry_at=now,
+            organization_id=organization_id,
         )
         return pid
 
@@ -363,3 +391,12 @@ class AppContext:
     profile: Any | None = None  # ProfileProvider; None en tests = perfil mínimo
     coalescer: Any | None = None
     relay_wake: asyncio.Event = field(default_factory=asyncio.Event)
+    # Modo de despacho multi-organización (app/multiorg.py): un CrmClient y un
+    # ProfileProvider por organización, cacheados aquí para que el turno y los
+    # workers de fondo reutilicen el mismo (el perfil tiene su propio TTL —
+    # sin cache por organización, una IA compartida serviría el perfil de la
+    # organización A a la B en cuanto las dos pidieran perfil en la misma
+    # ventana). `crm`/`profile` arriba siguen siendo el camino legacy
+    # (organization_id=None) y no se tocan.
+    crm_clients: dict[str, Any] = field(default_factory=dict)
+    profile_providers: dict[str, Any] = field(default_factory=dict)
