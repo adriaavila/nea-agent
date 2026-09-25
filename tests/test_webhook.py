@@ -189,6 +189,18 @@ async def test_post_firma_ausente(signed_client):
     assert resp.status_code == 401
 
 
+async def test_post_firma_no_ascii_es_401_no_500(signed_client):
+    """`hmac.compare_digest` truena con TypeError si se le pasa un string con
+    caracteres no-ASCII sin blindarlo antes — un header corrupto no debe
+    tumbar el endpoint con un 500."""
+    body = wa_body()
+    firma_no_ascii = ("sha256=" + "é" * 64).encode("utf-8")
+    resp = await signed_client.post(
+        "/webhook", content=body, headers={"x-hub-signature-256": firma_no_ascii}
+    )
+    assert resp.status_code == 401
+
+
 async def test_post_sin_secret_no_exige_firma(ctx, client, respx_mock):
     mock_crm_basics(respx_mock)
     resp = await client.post("/webhook", content=wa_body())
@@ -204,17 +216,44 @@ async def test_post_pide_reintento_si_no_puede_persistir(ctx, client, monkeypatc
     assert resp.status_code == 503
 
 
-async def test_arranque_persistente_exige_firma_de_meta_o_api_key_del_crm(monkeypatch):
-    """Sin META_APP_SECRET NI CRM_BOT_API_KEY, un arranque con persistencia
-    real no puede hablar de forma segura ni con Meta (/webhook) ni con el CRM
-    en modo despacho (/dispatch) — el guard sigue exigiendo uno de los dos."""
+async def test_relay_only_releva_pero_no_corre_turno(ctx, client, respx_mock):
+    """RELAY_ONLY=true (corte a modo despacho): el payload se releva al CRM
+    exactamente igual que siempre, pero NO se corre turno — ni LLM ni ninguna
+    llamada /api/bot/* (typing/context/messages), porque el CRM va a
+    despachar ese mismo turno por /dispatch. Sin este corte, el lead recibiría
+    dos respuestas para el mismo mensaje durante la transición."""
+    routes = mock_crm_basics(respx_mock)
+    ctx.settings.relay_only = True
+
+    resp = await client.post("/webhook", content=wa_body())
+    assert resp.status_code == 200
+    await asyncio.sleep(0.2)  # tiempo de sobra para que un turno (si corriera) actuara
+
+    assert len(ctx.store.relays) == 1  # el relay SÍ se encoló
+    assert ctx.llm.calls == []  # pero ningún turno llamó al LLM
+    for route in (routes["context"], routes["typing"], routes["messages"]):
+        assert route.call_count == 0
+
+
+async def test_arranque_persistente_exige_firma_de_meta(monkeypatch):
+    """Sin META_APP_SECRET, un arranque con persistencia real truena — SIEMPRE,
+    aunque CRM_BOT_API_KEY esté configurado. Un despliegue de un solo negocio
+    tiene CRM_BOT_API_KEY por defecto (le habla al CRM igual); si la sola
+    presencia de esa key bastara para dejar arrancar sin META_APP_SECRET, un
+    despliegue clásico que se quedó sin el secreto bootearía en verde y le
+    respondería 401 a cada entrega de Meta sin que nada avise (el guard
+    relajado que esto reemplaza). Solo DISPATCH_ONLY=true, explícito, lo
+    permite (ver el siguiente test)."""
     from app import main
 
     monkeypatch.setattr(
         main,
         "Settings",
         lambda: make_settings(
-            database_url="postgresql://db/nea", meta_app_secret="", crm_bot_api_key=""
+            database_url="postgresql://db/nea",
+            meta_app_secret="",
+            crm_bot_api_key="k",  # presente, como en CUALQUIER despliegue normal
+            dispatch_only=False,
         ),
     )
     app = main.create_app()
@@ -224,16 +263,19 @@ async def test_arranque_persistente_exige_firma_de_meta_o_api_key_del_crm(monkey
             pass
 
 
-async def test_arranque_persistente_solo_despacho_no_exige_meta_app_secret(monkeypatch):
-    """Con CRM_BOT_API_KEY configurado, un despliegue de solo-despacho puede
-    arrancar sin META_APP_SECRET (no habla con Meta — solo con el CRM)."""
+async def test_arranque_persistente_dispatch_only_no_exige_meta_app_secret(monkeypatch):
+    """Con DISPATCH_ONLY=true, un despliegue de solo-despacho puede arrancar
+    sin META_APP_SECRET (no habla con Meta — solo con el CRM)."""
     from app import main
 
     monkeypatch.setattr(
         main,
         "Settings",
         lambda: make_settings(
-            database_url="postgresql://db/nea", meta_app_secret="", crm_bot_api_key="k"
+            database_url="postgresql://db/nea",
+            meta_app_secret="",
+            crm_bot_api_key="k",
+            dispatch_only=True,
         ),
     )
 
@@ -260,14 +302,27 @@ async def test_arranque_persistente_solo_despacho_no_exige_meta_app_secret(monke
         pass  # no debe lanzar RuntimeError
 
 
-async def test_webhook_deshabilitado_en_despliegue_solo_despacho(ctx, client, monkeypatch):
-    """Con persistencia real y sin META_APP_SECRET (solo-despacho), el
-    webhook de Meta rechaza TODO en vez de aceptar payloads sin firma."""
-    ctx.settings.database_url = "postgresql://db/nea"
+async def test_webhook_deshabilitado_en_despliegue_dispatch_only(ctx, client):
+    """Con DISPATCH_ONLY=true y sin META_APP_SECRET, el webhook de Meta
+    rechaza TODO en vez de aceptar payloads sin firma."""
+    ctx.settings.dispatch_only = True
     ctx.settings.meta_app_secret = ""
 
     resp = await client.post("/webhook", content=wa_body())
     assert resp.status_code == 401
+
+
+async def test_webhook_sin_dispatch_only_sigue_aceptando_sin_firma(ctx, client, respx_mock):
+    """Sin DISPATCH_ONLY (el default), un secreto vacío sigue siendo el modo
+    dev de siempre — el webhook de Meta NO se deshabilita solo porque haya
+    persistencia real configurada. La bandera es la única señal."""
+    mock_crm_basics(respx_mock)
+    ctx.settings.database_url = "postgresql://db/nea"
+    ctx.settings.meta_app_secret = ""
+    ctx.settings.dispatch_only = False
+
+    resp = await client.post("/webhook", content=wa_body())
+    assert resp.status_code == 200
 
 
 # ---------------------------------------------------------------- dedup ---

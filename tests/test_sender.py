@@ -119,6 +119,29 @@ async def test_sender_abandona_por_409_sin_handoff(respx_mock):
     await ctx.crm.aclose()
 
 
+async def test_sender_usa_el_client_de_la_organizacion_del_pending(respx_mock):
+    """El organization_id viaja con el pending_send (app/turn.py); el
+    SenderWorker debe reintentar con el CrmClient de ESA organización, header
+    X-Organization-Id incluido, nunca con el legacy."""
+    ctx = make_ctx()
+    conv = await ctx.store.get_or_create_conversation(IDENTITY, organization_id="org_a")
+    pid = await ctx.store.enqueue_pending_send(
+        conv.id, CRM_CONV_ID, "hola org a", organization_id="org_a"
+    )
+    route = respx_mock.post(
+        f"{CRM_URL}/api/bot/messages", headers={"x-organization-id": "org_a"}
+    ).mock(return_value=httpx.Response(200, json={"messageId": "m1"}))
+    worker = SenderWorker(ctx)
+
+    await worker.tick()
+
+    assert route.call_count == 1
+    assert ctx.store.pending_sends[pid].delivered_at is not None
+    await ctx.crm.aclose()
+    for org_crm in ctx.crm_clients.values():
+        await org_crm.aclose()
+
+
 async def test_sender_agota_24h_abandona_y_alerta(respx_mock):
     ctx = make_ctx()
     conv = await ctx.store.get_or_create_conversation(IDENTITY)

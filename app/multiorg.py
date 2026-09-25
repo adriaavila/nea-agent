@@ -43,7 +43,15 @@ def crm_for(ctx: AppContext, organization_id: str | None) -> Any:
 
 def profile_for(ctx: AppContext, organization_id: str | None) -> Any:
     """El ProfileProvider de ESA organización (cacheado), o el legacy si es
-    None. Nunca comparte el TTL/cache con otra organización."""
+    None. Nunca comparte el TTL/cache con otra organización.
+
+    `brief_path` SIEMPRE None aquí a propósito: BRIEF_PATH es el brief local
+    de ESTE despliegue (un solo negocio, para correr sin CRM). Pasárselo a
+    una organización del despacho filtraría el negocio del dueño del
+    despliegue a CUALQUIER organización cuyo `/api/bot/profile` diera 404 —
+    exactamente la fuga que este módulo existe para evitar. Sin brief propio,
+    esa organización cae directo al perfil mínimo (ver app/profile.py).
+    """
     if organization_id is None:
         return ctx.profile
     provider = ctx.profile_providers.get(organization_id)
@@ -51,7 +59,7 @@ def profile_for(ctx: AppContext, organization_id: str | None) -> Any:
         provider = ProfileProvider(
             crm_for(ctx, organization_id),
             default_name=ctx.settings.agent_name,
-            brief_path=ctx.settings.brief_path or None,
+            brief_path=None,
         )
         ctx.profile_providers[organization_id] = provider
     return provider

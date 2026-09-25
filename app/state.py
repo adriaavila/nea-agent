@@ -121,6 +121,12 @@ class Store(Protocol):
     async def mark_processed(self, wa_message_id: str) -> bool:
         """True si el mensaje es nuevo (gana el INSERT); False si ya se procesó."""
         ...
+    async def release_processed(self, wa_message_ids: list[str]) -> None:
+        """Revierte el claim de mark_processed. Solo para el modo de despacho:
+        si el turno revienta después de reclamar los ids (respuesta 5xx al
+        CRM), hay que soltarlos — si no, el reintento del CRM los encuentra
+        YA procesados y el mensaje se pierde en silencio (200 sin turno)."""
+        ...
 
     # cola de relay
     async def enqueue_relay(self, body: bytes, signature: str | None) -> int: ...
@@ -213,6 +219,10 @@ class MemoryStore:
             return False
         self.processed.add(wa_message_id)
         return True
+
+    async def release_processed(self, wa_message_ids: list[str]) -> None:
+        for wid in wa_message_ids:
+            self.processed.discard(wid)
 
     async def enqueue_relay(self, body: bytes, signature: str | None) -> int:
         rid = next(self._ids)
@@ -400,3 +410,12 @@ class AppContext:
     # (organization_id=None) y no se tocan.
     crm_clients: dict[str, Any] = field(default_factory=dict)
     profile_providers: dict[str, Any] = field(default_factory=dict)
+    # ponytail: lock por proceso — si Nea llega a correr con más de una
+    # réplica hace falta un lock distribuido (p. ej. pg_advisory_xact_lock)
+    # en vez de este dict en memoria. Serializa dos despachos concurrentes de
+    # la MISMA (organización, identidad) — sin esto, dos turnos corriendo a
+    # la vez para el mismo lead pueden contestar los dos y pisarse el
+    # abandon_pending_sends el uno al otro.
+    dispatch_locks: dict[tuple[str | None, str], asyncio.Lock] = field(
+        default_factory=dict
+    )

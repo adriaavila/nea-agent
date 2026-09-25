@@ -77,13 +77,37 @@ Meta Cloud API ── webhook ──► Vocero CRM (multitenant)
 
 `POST /dispatch` se monta SIEMPRE junto al webhook de Meta de siempre — no hay
 bandera de modo, y `organization_id` NULL es exactamente el camino legacy de
-un solo negocio (así siguen funcionando despliegues de un solo negocio como
-nea-santorini, sin tocar nada). Cada organización tiene su propio
-`CrmClient`/`BusinessProfile` cacheados (`app/multiorg.py`): el perfil de una
+un solo negocio (un despliegue de un solo negocio no cambia en nada). Cada
+organización tiene su propio `CrmClient`/`BusinessProfile` cacheados
+(`app/multiorg.py`, NUNCA el `BRIEF_PATH` del despliegue): el perfil de una
 JAMÁS se sirve a otra. Sin coalesce (el CRM ya agrupó la ráfaga) y sin relay
-(el CRM ya tiene el mensaje) — el turno corre síncrono dentro del request y
-responde 200 solo al terminar (5xx si revienta, para que el CRM reintente el
-job). Detalle completo: `app/dispatch.py` y `.env.example`.
+(el CRM ya tiene el mensaje) — el turno corre síncrono dentro del request
+(con un timeout propio y un lock por conversación, ver `app/dispatch.py`) y
+responde 200 solo al terminar (5xx si revienta o se cuelga, liberando los ids
+reclamados para que el reintento del CRM no los encuentre "ya procesados").
+
+**nea-santorini (producción, single-tenant) corre la rama `main`, NO esta
+rama** — la migración `003_org.sql` y el modo despacho todavía no la tocan.
+Cuando ese despliegue sí actualice a un commit con esta migración, el
+rollback documentado (constraint `UNIQUE(wa_identity)` de vuelta) está al
+principio de `migrations/003_org.sql`.
+
+**Corte de un solo negocio a modo despacho** (p. ej. allok migrando su propio
+número): desplegar Nea con `RELAY_ONLY=true` justo cuando el CRM empiece a
+mandarle `NEA_DISPATCH_URL` — con esa bandera, `/webhook` sigue verificando
+firma, persistiendo y releando cada payload de Meta exactamente igual que
+hoy, pero deja de correr turnos (sin coalesce, sin "escribiendo…"): el CRM va
+a correr ESE turno por `/dispatch`. Sin el corte, durante la transición Nea
+contestaría el mismo mensaje dos veces. Detalle completo: `app/dispatch.py`,
+`app/webhook.py` y `.env.example`.
+
+Despliegue de solo-despacho puro (esta Nea nunca recibe el webhook de Meta
+directamente): además de `RELAY_ONLY`, existe `DISPATCH_ONLY=true`, que deja
+arrancar sin `META_APP_SECRET` — sin la bandera explícita, el arranque con
+persistencia sigue exigiendo el secreto SIEMPRE (`CRM_BOT_API_KEY` no cuenta:
+lo tiene cualquier despliegue normal, así que por sí sola dejaría arrancar en
+verde a un despliegue clásico que se quedó sin secreto, y Meta empezaría a
+recibir 401 sin que nada avise).
 
 ### La agenda, contra el motor universal del CRM (Vocero 015)
 

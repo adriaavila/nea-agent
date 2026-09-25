@@ -80,6 +80,14 @@ class PgStore:
         )
         return row is not None
 
+    async def release_processed(self, wa_message_ids: list[str]) -> None:
+        if not wa_message_ids:
+            return
+        await self.pool.execute(
+            "DELETE FROM processed_message WHERE wa_message_id = ANY($1::text[])",
+            wa_message_ids,
+        )
+
     # -------------------------------------------------------------- relay ---
 
     async def enqueue_relay(self, body: bytes, signature: str | None) -> int:

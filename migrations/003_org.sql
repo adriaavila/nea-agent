@@ -21,6 +21,31 @@
 -- NULL como un mismo namespace ('').
 --
 -- Idempotente (re-correr en cada arranque es seguro, Constitución III).
+--
+-- ## Rollback (manual — nada de esto corre solo)
+--
+-- Si hay que volver al código de ANTES de esta migración (el que hace
+-- `ON CONFLICT (wa_identity)` a secas — ese `ON CONFLICT` truena en cuanto el
+-- constraint de abajo ya no existe, así que un rollback de CÓDIGO sin
+-- rollback de MIGRACIÓN no arranca):
+--
+--   1. Verificar que la promesa siga siendo cierta (ninguna identidad
+--      compartida entre organizaciones — si esto devuelve filas, el rollback
+--      pierde información: dos conversaciones de organizaciones distintas se
+--      fusionarían en una al recrear el UNIQUE(wa_identity) global):
+--        SELECT wa_identity FROM bot_conversation
+--        GROUP BY wa_identity HAVING COUNT(DISTINCT organization_id) > 1;
+--   2. DROP INDEX IF EXISTS uq_bot_conversation_org_identity;
+--   3. ALTER TABLE bot_conversation
+--        ADD CONSTRAINT bot_conversation_wa_identity_key UNIQUE (wa_identity);
+--   4. Las columnas organization_id pueden quedarse — el código viejo nunca
+--      las lee ni las escribe, así que no hace falta un DROP COLUMN.
+--
+-- IMPORTANTE: nea-santorini (single-tenant, en producción) corre la rama
+-- `main`, NO esta rama (`feat/dispatch-multiorg` / `codex/nea-production`)
+-- todavía. Esta migración solo se aplica cuando ESE despliegue se actualice a
+-- un commit que la incluya — hasta entonces, este rollback es documentación,
+-- no una operación pendiente contra producción.
 
 ALTER TABLE bot_conversation ADD COLUMN IF NOT EXISTS organization_id TEXT;
 ALTER TABLE pending_send ADD COLUMN IF NOT EXISTS organization_id TEXT;

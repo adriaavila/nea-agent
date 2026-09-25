@@ -53,15 +53,26 @@ def create_app(ctx: AppContext | None = None) -> FastAPI:
         own_resources = app.state.ctx is None
         if own_resources:
             settings = Settings()
-            if (
-                settings.database_url
-                and not settings.meta_app_secret
-                and not settings.crm_bot_api_key
-            ):
-                raise RuntimeError(
-                    "META_APP_SECRET es obligatorio con persistencia habilitada, "
-                    "salvo que CRM_BOT_API_KEY esté configurado (despliegue de "
-                    "solo-despacho: /webhook queda deshabilitado y solo corre /dispatch)"
+            if settings.database_url and not settings.meta_app_secret:
+                if not settings.dispatch_only:
+                    # CRM_BOT_API_KEY casi siempre está configurado (TODO
+                    # despliegue de un solo negocio también le habla al CRM),
+                    # así que NO basta como señal de "esto es solo-despacho" —
+                    # un despliegue clásico que se quedó sin META_APP_SECRET
+                    # arrancaría en verde y le respondería 401 a cada entrega
+                    # de Meta sin que nada avise. DISPATCH_ONLY tiene que ser
+                    # explícito.
+                    raise RuntimeError(
+                        "META_APP_SECRET es obligatorio con persistencia habilitada, "
+                        "salvo que DISPATCH_ONLY=true (despliegue de solo-despacho: "
+                        "/webhook queda deshabilitado y solo corre /dispatch)"
+                    )
+                logger.warning(
+                    "DISPATCH_ONLY=true sin META_APP_SECRET: /webhook va a "
+                    "RECHAZAR TODAS las peticiones de Meta con 401 — esta "
+                    "instancia solo atiende /dispatch. Si esto es un "
+                    "despliegue de UN solo negocio, es una falla silenciosa: "
+                    "revisa META_APP_SECRET/DISPATCH_ONLY ahora."
                 )
             store = PgStore(settings.database_url)
             await store.connect()
@@ -109,6 +120,11 @@ def create_app(ctx: AppContext | None = None) -> FastAPI:
             await relay_worker.aclose()
             if c.coalescer is not None:
                 await c.coalescer.aclose()
+            # Los CrmClient por organización (modo despacho, app/multiorg.py)
+            # los abre este proceso bajo demanda — nadie más los cierra, a
+            # diferencia del `c.crm` legacy que en tests gestiona el fixture.
+            for org_crm in c.crm_clients.values():
+                await org_crm.aclose()
             if own_resources:
                 await c.crm.aclose()
                 await c.store.aclose()

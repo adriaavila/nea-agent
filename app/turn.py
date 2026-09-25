@@ -93,19 +93,25 @@ async def run_turn(
     organization_id: str | None = None,
     crm_conversation_id: str | None = None,
     bypass_allowlist: bool = False,
+    strict: bool = False,
 ) -> None:
     """Corre un turno completo.
 
-    `organization_id`/`crm_conversation_id`/`bypass_allowlist` solo los usa el
-    modo de despacho multi-organización (app/dispatch.py): `ctx` ya viene con
-    el `crm`/`profile` de la organización correcta (app/multiorg.scoped_ctx),
-    `organization_id` se persiste en bot_conversation/pending_send para que
-    los workers de fondo sepan con quién hablar, `crm_conversation_id` evita
-    resolver el contexto por waIdentity (el CRM enruta por conversationId), y
-    `bypass_allowlist` deja pasar a las conversaciones de prueba del
-    Laboratorio aunque la organización tenga la allowlist encendida. El
-    camino legacy (webhook de Meta) no pasa ninguno — comportamiento idéntico
-    al de siempre.
+    `organization_id`/`crm_conversation_id`/`bypass_allowlist`/`strict` solo
+    los usa el modo de despacho multi-organización (app/dispatch.py): `ctx`
+    ya viene con el `crm`/`profile` de la organización correcta
+    (app/multiorg.scoped_ctx), `organization_id` se persiste en
+    bot_conversation/pending_send para que los workers de fondo sepan con
+    quién hablar, `crm_conversation_id` evita resolver el contexto por
+    waIdentity (el CRM enruta por conversationId) y hace UN solo intento (sin
+    esperar al relay, que en este modo no existe), `bypass_allowlist` deja
+    pasar a las conversaciones de prueba del Laboratorio aunque la
+    organización tenga la allowlist encendida, y `strict=True` convierte un
+    fallo real del CRM (context, activate) en una excepción que se propaga —
+    dispatch.py la vuelve 5xx para que el CRM reintente el job — en vez del
+    silencio+200 del camino legacy, donde "no hay respuesta" y "el CRM está
+    caído" son indistinguibles para quien llamó. El camino legacy (webhook de
+    Meta) no pasa ninguno — comportamiento idéntico al de siempre.
     """
     settings = ctx.settings
     conv = await ctx.store.get_or_create_conversation(
@@ -114,7 +120,9 @@ async def run_turn(
     await ctx.store.abandon_pending_sends(conv.id)
 
     # --- Gate 1: contexto + allowlist administrada por el CRM -------------
-    context = await _fetch_context(ctx, identity, crm_conversation_id=crm_conversation_id)
+    context = await _fetch_context(
+        ctx, identity, crm_conversation_id=crm_conversation_id, strict=strict
+    )
     if context is None:
         logger.warning("turno %s: sin contexto del CRM — silencio", identity)
         return
@@ -132,7 +140,9 @@ async def run_turn(
         (bypass_allowlist or (restricted and canonical_identity(identity) in allowed))
         and any((m.text or "").strip().lower() in RESET_COMMANDS for m in inbound)
     ):
-        await _run_reset(ctx, conv, identity, crm_conversation_id=crm_conversation_id)
+        await _run_reset(
+            ctx, conv, identity, crm_conversation_id=crm_conversation_id, strict=strict
+        )
         return
 
     # --- Gate 2: aiEnabled y ventana --------------------------------------
@@ -150,6 +160,8 @@ async def run_turn(
             await ctx.crm.post_activate(str(crm_conv_id))
         except CrmError as exc:
             logger.warning("turno %s: no pude activar el chat (%s) — silencio", identity, exc)
+            if strict:
+                raise
             return
         conversation_info["aiEnabled"] = True
         await ctx.store.update_conversation(
@@ -273,7 +285,11 @@ async def run_turn(
     else:
         if runtime.proposed:
             updates["phase"] = "agendando"
-        if sent and not conv.followup_sent:
+        # Las conversaciones de prueba del Laboratorio (identidad
+        # `test:<conversationId>`) no son un lead real — no tiene sentido
+        # empujarlas con un seguimiento a las N horas.
+        is_lab_conversation = identity.startswith("test:")
+        if sent and not conv.followup_sent and not is_lab_conversation:
             updates["followup_due_at"] = utcnow() + timedelta(
                 hours=settings.followup_hours
             )
@@ -285,12 +301,21 @@ async def _run_reset(
     conv: Any,
     identity: str,
     crm_conversation_id: str | None = None,
+    strict: bool = False,
 ) -> None:
     """Reinicio de pruebas: CRM primero (ficha limpia + IA reactivada, para que
-    la confirmación no rebote con 409 ai_paused) y luego la memoria local."""
-    crm_conv_id = conv.crm_conversation_id or crm_conversation_id
+    la confirmación no rebote con 409 ai_paused) y luego la memoria local.
+
+    Prefiere el `crm_conversation_id` que trajo ESTE despacho sobre el
+    guardado en `conv` — el que acaba de mandar el CRM es, por definición, el
+    vigente; el guardado puede haber quedado stale si la conversación se
+    recreó del lado del CRM.
+    """
+    crm_conv_id = crm_conversation_id or conv.crm_conversation_id
     if not crm_conv_id:
-        context = await _fetch_context(ctx, identity, crm_conversation_id=crm_conversation_id)
+        context = await _fetch_context(
+            ctx, identity, crm_conversation_id=crm_conversation_id, strict=strict
+        )
         crm_conv_id = ((context or {}).get("conversation") or {}).get("id")
     if crm_conv_id:
         try:
@@ -310,9 +335,18 @@ async def _run_reset(
 
 
 async def _fetch_context(
-    ctx: AppContext, identity: str, *, crm_conversation_id: str | None = None
+    ctx: AppContext,
+    identity: str,
+    *,
+    crm_conversation_id: str | None = None,
+    strict: bool = False,
 ) -> dict[str, Any] | None:
-    for attempt in range(CONTEXT_ATTEMPTS):
+    """`strict=True` (modo despacho): UN solo intento — el CRM ya guardó el
+    mensaje antes de despachar, no hay relay corriendo en paralelo que
+    esperar — y un CrmError real (no un simple "no lo conozco") se PROPAGA en
+    vez de volverse silencio, para que dispatch.py responda 5xx."""
+    attempts = 1 if strict else CONTEXT_ATTEMPTS
+    for attempt in range(attempts):
         try:
             context = await ctx.crm.get_context(
                 identity, conversation_id=crm_conversation_id
@@ -324,16 +358,18 @@ async def _fetch_context(
                 attempt + 1,
                 exc,
             )
+            if strict:
+                raise
             context = None
         # El relay y este turno corren en paralelo. Un chat conocido puede
         # llegar todavía con la ventana vieja cerrada; espera a que el CRM
         # persista el mensaje entrante que acaba de reabrirla.
         if context is not None and (
             (context.get("conversation") or {}).get("windowOpen", False)
-            or attempt == CONTEXT_ATTEMPTS - 1
+            or attempt == attempts - 1
         ):
             return context
-        if attempt < CONTEXT_ATTEMPTS - 1:
+        if attempt < attempts - 1:
             await asyncio.sleep(1.0)  # chance a que el relay aterrice en el CRM
     return None
 
