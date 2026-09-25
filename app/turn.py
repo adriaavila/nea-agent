@@ -20,7 +20,7 @@ from app.hostility import ALERT as HOSTILITY_ALERT, hostile_streak
 from app.llm import LlmExhausted
 from app.profile import resolve_profile
 from app.prompt import build_system_prompt
-from app.state import AppContext, InboundMessage, utcnow
+from app.state import AppContext, InboundMessage, TurnCommit, utcnow
 from app.tools import TOOL_SCHEMAS, ToolRuntime
 
 logger = logging.getLogger("nea.turn")
@@ -94,24 +94,29 @@ async def run_turn(
     crm_conversation_id: str | None = None,
     bypass_allowlist: bool = False,
     strict: bool = False,
+    commit: TurnCommit | None = None,
 ) -> None:
     """Corre un turno completo.
 
-    `organization_id`/`crm_conversation_id`/`bypass_allowlist`/`strict` solo
-    los usa el modo de despacho multi-organización (app/dispatch.py): `ctx`
-    ya viene con el `crm`/`profile` de la organización correcta
-    (app/multiorg.scoped_ctx), `organization_id` se persiste en
-    bot_conversation/pending_send para que los workers de fondo sepan con
-    quién hablar, `crm_conversation_id` evita resolver el contexto por
-    waIdentity (el CRM enruta por conversationId) y hace UN solo intento (sin
-    esperar al relay, que en este modo no existe), `bypass_allowlist` deja
-    pasar a las conversaciones de prueba del Laboratorio aunque la
-    organización tenga la allowlist encendida, y `strict=True` convierte un
-    fallo real del CRM (context, activate) en una excepción que se propaga —
-    dispatch.py la vuelve 5xx para que el CRM reintente el job — en vez del
-    silencio+200 del camino legacy, donde "no hay respuesta" y "el CRM está
-    caído" son indistinguibles para quien llamó. El camino legacy (webhook de
-    Meta) no pasa ninguno — comportamiento idéntico al de siempre.
+    `organization_id`/`crm_conversation_id`/`bypass_allowlist`/`strict`/
+    `commit` solo los usa el modo de despacho multi-organización
+    (app/dispatch.py): `ctx` ya viene con el `crm`/`profile` de la
+    organización correcta (app/multiorg.scoped_ctx), `organization_id` se
+    persiste en bot_conversation/pending_send para que los workers de fondo
+    sepan con quién hablar, `crm_conversation_id` evita resolver el contexto
+    por waIdentity (el CRM enruta por conversationId) y hace UN solo intento
+    (sin esperar al relay, que en este modo no existe), `bypass_allowlist`
+    deja pasar a las conversaciones de prueba del Laboratorio aunque la
+    organización tenga la allowlist encendida, `strict=True` convierte un
+    fallo real del CRM (context, perfil, activate) en una excepción que se
+    propaga — dispatch.py la vuelve 5xx para que el CRM reintente el job — en
+    vez del silencio+200 del camino legacy, y `commit` (ver
+    app/state.TurnCommit) se marca justo antes del primer efecto irreversible
+    hacia el CRM (mandar el mensaje, reservar/mover cita): dispatch.py lo usa
+    para decidir si un fallo DESPUÉS de ese punto debe reintentarse (nunca —
+    correría el LLM de nuevo y mandaría una SEGUNDA respuesta real) o no. El
+    camino legacy (webhook de Meta) no pasa ninguno — comportamiento idéntico
+    al de siempre.
     """
     settings = ctx.settings
     conv = await ctx.store.get_or_create_conversation(
@@ -141,7 +146,13 @@ async def run_turn(
         and any((m.text or "").strip().lower() in RESET_COMMANDS for m in inbound)
     ):
         await _run_reset(
-            ctx, conv, identity, crm_conversation_id=crm_conversation_id, strict=strict
+            ctx,
+            conv,
+            identity,
+            crm_conversation_id=crm_conversation_id,
+            strict=strict,
+            organization_id=organization_id,
+            commit=commit,
         )
         return
 
@@ -151,7 +162,7 @@ async def run_turn(
     if not crm_conv_id:
         logger.warning("turno %s: contexto sin conversationId — silencio", identity)
         return
-    profile = await resolve_profile(ctx)
+    profile = await resolve_profile(ctx, strict=strict)
     if not conversation_info.get("aiEnabled", False):
         if not profile.activation_enabled or not _activation_matches(profile, inbound):
             logger.info("turno %s: chat pausado y sin mensaje activador — silencio", identity)
@@ -239,7 +250,7 @@ async def run_turn(
         ]
 
     # --- LLM con tools ----------------------------------------------------
-    runtime = ToolRuntime(ctx, conv, str(crm_conv_id), profile=profile)
+    runtime = ToolRuntime(ctx, conv, str(crm_conv_id), profile=profile, commit=commit)
     try:
         final_text = await _tool_loop(ctx, messages, runtime)
     except LlmExhausted as exc:
@@ -268,6 +279,7 @@ async def run_turn(
             str(crm_conv_id),
             final_text.strip(),
             organization_id=organization_id,
+            commit=commit,
         )
         if sent:
             await ctx.store.add_message(conv.id, "assistant", final_text.strip())
@@ -302,6 +314,8 @@ async def _run_reset(
     identity: str,
     crm_conversation_id: str | None = None,
     strict: bool = False,
+    organization_id: str | None = None,
+    commit: TurnCommit | None = None,
 ) -> None:
     """Reinicio de pruebas: CRM primero (ficha limpia + IA reactivada, para que
     la confirmación no rebote con 409 ai_paused) y luego la memoria local.
@@ -331,6 +345,8 @@ async def _run_reset(
             str(crm_conv_id),
             "🧹 Listo: memoria reiniciada. Te trato como lead nuevo desde tu "
             "próximo mensaje. (Comando de pruebas, solo líneas autorizadas.)",
+            organization_id=organization_id,
+            commit=commit,
         )
 
 
@@ -422,10 +438,20 @@ async def _send(
     crm_conv_id: str,
     text: str,
     organization_id: str | None = None,
+    commit: TurnCommit | None = None,
 ) -> bool:
     """Envía vía el CRM. Si el turno agota sus reintentos, la respuesta NO se
     descarta: se encola en pending_send y el SenderWorker la reintenta con
-    backoff hasta entregar o agotar 24 h (incidente 2026-08-03)."""
+    backoff hasta entregar o agotar 24 h (incidente 2026-08-03).
+
+    Marca `commit` ANTES del primer intento de red, no después de un éxito:
+    incluso un intento que "falla" de nuestro lado puede haber llegado al
+    otro — y aunque no llegara, un reintento del turno completo generaría una
+    respuesta DISTINTA del LLM y la mandaría también. Pasado este punto ya no
+    es seguro reintentar el turno entero desde cero.
+    """
+    if commit is not None:
+        commit.mark()
     for attempt in range(SEND_ATTEMPTS):
         try:
             await ctx.crm.send_message(crm_conv_id, text)

@@ -50,6 +50,19 @@ class Settings(BaseSettings):
     # webhook de siempre y otra por el despacho nuevo.
     relay_only: bool = False
 
+    # Cutover de leads existentes: esta Nea ya servía a UN negocio en modo
+    # legacy (organization_id NULL) antes de que ese negocio se sumara al
+    # despacho multi-organización. Sin esto, la primera vez que el CRM
+    # despache un turno de ESE negocio, get_or_create_conversation crea una
+    # fila NUEVA bajo (orgId, identidad) — el lead pierde su historial y
+    # "greeted", y los followups legacy ya agendados siguen disparando por el
+    # cliente global en vez de por el de la organización. Con esta variable,
+    # al arrancar (después de migrar) se adoptan TODAS las filas legacy hacia
+    # este organization_id — una sola vez, de forma idempotente (ver
+    # PgStore.adopt_legacy_rows). Usar junto con RELAY_ONLY=true el día del
+    # corte (ver README).
+    legacy_organization_id: str = ""
+
     # CRM (vocero-crm, bot gateway /api/bot/*)
     crm_base_url: str = "http://localhost:3000"
     crm_webhook_url: str = ""  # incluye el segmento del verify token del CRM

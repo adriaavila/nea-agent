@@ -28,6 +28,15 @@ _CONV_COLUMNS = frozenset(
 )
 
 
+def _rows_affected(command_status: str) -> int:
+    """asyncpg devuelve el status crudo de Postgres ("UPDATE 3") en vez del
+    conteo — el número siempre es el último token."""
+    try:
+        return int(command_status.split()[-1])
+    except (ValueError, IndexError):
+        return 0
+
+
 def _conv_from_row(row: asyncpg.Record) -> Conversation:
     return Conversation(
         id=row["id"],
@@ -396,6 +405,22 @@ class PgStore:
             conversation_id,
         )
         return row is not None
+
+    # ------------------------------------------------- corte a despacho ---
+
+    async def adopt_legacy_rows(self, organization_id: str) -> tuple[int, int]:
+        """Idempotente: la segunda corrida (siguiente arranque) no encuentra
+        NULL que adoptar y devuelve (0, 0). La tabla es la fuente de verdad
+        (a diferencia de MemoryStore no hay índice aparte que reindexar)."""
+        conv_status = await self.pool.execute(
+            "UPDATE bot_conversation SET organization_id = $1 WHERE organization_id IS NULL",
+            organization_id,
+        )
+        pending_status = await self.pool.execute(
+            "UPDATE pending_send SET organization_id = $1 WHERE organization_id IS NULL",
+            organization_id,
+        )
+        return _rows_affected(conv_status), _rows_affected(pending_status)
 
     # --------------------------------------------------------------- misc ---
 

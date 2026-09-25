@@ -40,7 +40,7 @@ from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from app.config import canonical_identity
 from app.multiorg import scoped_ctx
-from app.state import AppContext, InboundMessage
+from app.state import AppContext, InboundMessage, TurnCommit
 from app.turn import run_turn
 
 logger = logging.getLogger("nea.dispatch")
@@ -143,13 +143,55 @@ def messages_from_dispatch(
 def _lock_for(ctx: AppContext, organization_id: str, identity: str) -> asyncio.Lock:
     """Lock por (organización, identidad): serializa despachos concurrentes
     de la MISMA conversación en este proceso (ver AppContext.dispatch_locks
-    — nota de escalado ahí)."""
+    — nota de escalado ahí). `ctx.dispatch_locks` es un WeakValueDictionary:
+    basta con NO guardar una referencia fuerte propia más allá del request
+    para que se limpie solo en cuanto nadie más lo esté usando."""
     key = (organization_id, identity)
     lock = ctx.dispatch_locks.get(key)
     if lock is None:
         lock = asyncio.Lock()
         ctx.dispatch_locks[key] = lock
     return lock
+
+
+async def _release_claimed_ids(ctx: AppContext, claimed_ids: list[str]) -> None:
+    """Suelta el claim de mark_processed. Se blinda con su propio try/except:
+    si ESTO falla, los ids quedan atascados como "procesados" y el CRM jamás
+    podrá reintentarlos solo — hace falta intervención manual, así que se
+    loguea fuerte en vez de dejarlo pasar en silencio."""
+    if not claimed_ids:
+        return
+    try:
+        await asyncio.shield(ctx.store.release_processed(claimed_ids))
+    except Exception:
+        logger.exception(
+            "dispatch: release_processed FALLÓ para %s — quedan atascados "
+            "como 'procesados'; el CRM NO va a poder reintentarlos solo, "
+            "hace falta intervención manual",
+            claimed_ids,
+        )
+
+
+def _log_background_outcome(organization_id: str, conversation_id: str):
+    """Callback para el turno que sigue corriendo en segundo plano tras un
+    timeout post-commit (ver dispatch()): ya respondimos 200, pero si termina
+    en error igual queremos que quede en el log — nunca "Task exception was
+    never retrieved" silencioso."""
+
+    def _callback(task: "asyncio.Task[None]") -> None:
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error(
+                "dispatch %s/%s: el turno en segundo plano (post-commit) "
+                "terminó con error DESPUÉS de responder 200: %s",
+                organization_id,
+                conversation_id,
+                exc,
+            )
+
+    return _callback
 
 
 @router.post("/dispatch")
@@ -228,35 +270,90 @@ async def dispatch(request: Request) -> Any:
     # (app/multiorg.py), nunca los legacy de ctx.crm/ctx.profile.
     turn_ctx = scoped_ctx(ctx, organization_id)
     lock = _lock_for(ctx, organization_id, identity)
+    # Se marca justo antes del primer efecto irreversible (send_message,
+    # create_booking, reschedule — ver app/turn.py y app/tools.py). Antes de
+    # ese punto un fallo es seguro de reintentar desde cero; después, NO — un
+    # reintento correría el LLM de nuevo y mandaría una respuesta DISTINTA.
+    commit = TurnCommit()
 
+    async def _run() -> None:
+        async with lock:
+            await run_turn(
+                turn_ctx,
+                identity,
+                fresh,
+                organization_id=organization_id,
+                crm_conversation_id=conversation_id,
+                bypass_allowlist=payload.isTest,
+                strict=True,
+                commit=commit,
+            )
+
+    # asyncio.shield: un TimeoutError de wait_for cancela la ESPERA de
+    # dispatch() por esta tarea, NO la tarea en sí — así, si el timeout llega
+    # DESPUÉS del commit, el turno sigue corriendo hasta terminar (mandar el
+    # handoff, actualizar la fase…) en vez de que la cancelación interrumpa a
+    # medias justo después de que el lead ya recibió una respuesta real.
+    task: "asyncio.Task[None]" = asyncio.create_task(_run())
+    task.add_done_callback(_log_background_outcome(organization_id, conversation_id))
+
+    # `handled` + el `finally`: si algo escapa de los dos `except` de abajo
+    # (típicamente un CancelledError — el propio request se cortó, cliente
+    # desconectado, servidor reiniciando; ni TimeoutError ni Exception lo
+    # capturan) el `finally` sigue corriendo igual, y decide si soltar los
+    # ids con la MISMA regla (nunca si ya se comprometió algo). Sin esto, esa
+    # ruta de salida dejaría los ids atascados como "procesados" para
+    # siempre.
+    handled = False
     try:
-        async with asyncio.timeout(DISPATCH_TIMEOUT_SECONDS):
-            async with lock:
-                await run_turn(
-                    turn_ctx,
-                    identity,
-                    fresh,
-                    organization_id=organization_id,
-                    crm_conversation_id=conversation_id,
-                    bypass_allowlist=payload.isTest,
-                    strict=True,
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=DISPATCH_TIMEOUT_SECONDS)
+        except TimeoutError:
+            if commit.done:
+                logger.error(
+                    "dispatch %s/%s: tardó más de %.0f s DESPUÉS de "
+                    "comprometerse (ya se le respondió/reservó al lead) — "
+                    "200, el turno sigue en segundo plano, ids se quedan "
+                    "reclamados",
+                    organization_id,
+                    conversation_id,
+                    DISPATCH_TIMEOUT_SECONDS,
                 )
-    except TimeoutError:
-        logger.error(
-            "dispatch %s/%s: el turno tardó más de %.0f s — 500, ids liberados",
-            organization_id,
-            conversation_id,
-            DISPATCH_TIMEOUT_SECONDS,
-        )
-        await ctx.store.release_processed(claimed_ids)
-        return JSONResponse({"error": "el turno tardó demasiado"}, status_code=500)
-    except Exception:
-        logger.exception(
-            "dispatch %s/%s: el turno reventó — 500 para que el CRM reintente, "
-            "ids liberados",
-            organization_id,
-            conversation_id,
-        )
-        await ctx.store.release_processed(claimed_ids)
-        return JSONResponse({"error": "el turno falló"}, status_code=500)
-    return {"ok": True}
+                handled = True
+                return {"ok": True}
+            logger.error(
+                "dispatch %s/%s: tardó más de %.0f s ANTES de comprometerse "
+                "— 500, ids liberados",
+                organization_id,
+                conversation_id,
+                DISPATCH_TIMEOUT_SECONDS,
+            )
+            task.cancel()
+            await _release_claimed_ids(ctx, claimed_ids)
+            handled = True
+            return JSONResponse({"error": "el turno tardó demasiado"}, status_code=500)
+        except Exception:
+            if commit.done:
+                logger.exception(
+                    "dispatch %s/%s: falló DESPUÉS de comprometerse (ya se "
+                    "le respondió/reservó al lead) — 200 para NO reintentar "
+                    "y duplicar, ids se quedan reclamados",
+                    organization_id,
+                    conversation_id,
+                )
+                handled = True
+                return {"ok": True}
+            logger.exception(
+                "dispatch %s/%s: el turno reventó ANTES de comprometerse — "
+                "500 para que el CRM reintente, ids liberados",
+                organization_id,
+                conversation_id,
+            )
+            await _release_claimed_ids(ctx, claimed_ids)
+            handled = True
+            return JSONResponse({"error": "el turno falló"}, status_code=500)
+        handled = True
+        return {"ok": True}
+    finally:
+        if not handled and not commit.done:
+            await _release_claimed_ids(ctx, claimed_ids)

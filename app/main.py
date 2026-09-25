@@ -78,6 +78,21 @@ def create_app(ctx: AppContext | None = None) -> FastAPI:
             await store.connect()
             await store.migrate(MIGRATIONS_DIR)
             logger.info("migraciones aplicadas — DB lista")
+            if settings.legacy_organization_id:
+                # Cutover: adopta las filas que quedaron en el namespace
+                # legacy (organization_id NULL) hacia esta organización.
+                # Idempotente — en arranques posteriores no hay nada NULL que
+                # mover y esto es un no-op instantáneo.
+                moved_conv, moved_pending = await store.adopt_legacy_rows(
+                    settings.legacy_organization_id
+                )
+                logger.warning(
+                    "LEGACY_ORGANIZATION_ID=%s: %d conversaciones y %d "
+                    "pending_send adoptados del namespace legacy",
+                    settings.legacy_organization_id,
+                    moved_conv,
+                    moved_pending,
+                )
             crm = CrmClient(settings.crm_base_url, settings.crm_bot_api_key)
             app.state.ctx = AppContext(
                 settings=settings,

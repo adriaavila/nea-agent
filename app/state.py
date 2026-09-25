@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import weakref
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Protocol
@@ -111,6 +112,30 @@ class InboundMessage:
     contact_names: list[str] = field(default_factory=list)
 
 
+class TurnCommit:
+    """Marca el punto de no-retorno de UN turno de despacho.
+
+    Antes del primer efecto irreversible hacia el CRM (mandar el mensaje,
+    reservar/mover una cita) un fallo es seguro de reintentar desde cero: el
+    CRM no vio nada todavía. Después, un reintento correría el LLM de nuevo
+    (con una respuesta probablemente DISTINTA) y la mandaría — un segundo
+    mensaje real al lead. `run_turn`/`ToolRuntime` llaman `mark()` justo antes
+    de ESE primer intento (`app/turn.py._send`, `app/tools.py._book_session`);
+    `app/dispatch.py` lo consulta para decidir si un fallo posterior a ese
+    punto debe volverse un 5xx (reintentable) o un 200 silencioso (ya se dijo
+    algo real; solo queda loguear y dejar los ids reclamados como están).
+
+    `None` en cualquier llamador (webhook legacy, tests viejos) es un no-op:
+    el camino de siempre no tiene concepto de "reintento del llamador".
+    """
+
+    def __init__(self) -> None:
+        self.done = False
+
+    def mark(self) -> None:
+        self.done = True
+
+
 # --------------------------------------------------------------- contrato ---
 
 
@@ -190,6 +215,15 @@ class Store(Protocol):
     async def due_followups(self, now: datetime) -> list[Conversation]: ...
     async def claim_followup(self, conversation_id: int) -> bool:
         """Marca followup_sent=True atómicamente. True si ESTA llamada lo ganó."""
+        ...
+
+    # corte a modo despacho (LEGACY_ORGANIZATION_ID, ver app/main.py)
+    async def adopt_legacy_rows(self, organization_id: str) -> tuple[int, int]:
+        """Adopta TODAS las filas del namespace legacy (organization_id NULL)
+        hacia `organization_id`, en bot_conversation y pending_send. Devuelve
+        (conversaciones movidas, pending_send movidos). Idempotente: correrlo
+        de nuevo tras la primera adopción no mueve nada más (ya no queda NULL
+        que adoptar)."""
         ...
 
     async def ping(self) -> None: ...
@@ -380,6 +414,30 @@ class MemoryStore:
         conv.followup_sent = True
         return True
 
+    async def adopt_legacy_rows(self, organization_id: str) -> tuple[int, int]:
+        # El índice por identidad va con clave (organization_id o "", wa_identity)
+        # — no basta con mutar Conversation.organization_id, hay que MOVER la
+        # entrada del índice o get_or_create_conversation("org_a", identity)
+        # nunca encontraría la fila adoptada y crearía una NUEVA vacía.
+        moved_conv = 0
+        reindexed: dict[tuple[str, str], int] = {}
+        for (org_key, identity), cid in self._conv_by_identity.items():
+            conv = self.conversations[cid]
+            if conv.organization_id is None:
+                conv.organization_id = organization_id
+                reindexed[(organization_id, identity)] = cid
+                moved_conv += 1
+            else:
+                reindexed[(org_key, identity)] = cid
+        self._conv_by_identity = reindexed
+
+        moved_pending = 0
+        for pending in self.pending_sends.values():
+            if pending.organization_id is None:
+                pending.organization_id = organization_id
+                moved_pending += 1
+        return moved_conv, moved_pending
+
     async def ping(self) -> None:
         return None
 
@@ -416,6 +474,14 @@ class AppContext:
     # la MISMA (organización, identidad) — sin esto, dos turnos corriendo a
     # la vez para el mismo lead pueden contestar los dos y pisarse el
     # abandon_pending_sends el uno al otro.
-    dispatch_locks: dict[tuple[str | None, str], asyncio.Lock] = field(
-        default_factory=dict
+    #
+    # WeakValueDictionary a propósito: sin esto, cada (organización,
+    # identidad) que alguna vez despachó deja un Lock vivo para siempre — una
+    # fuga lenta en un proceso de larga vida con miles de leads. Con la
+    # referencia débil, el Lock desaparece solo en cuanto nadie lo sigue
+    # usando (el `lock` local de app/dispatch.dispatch() sale de scope al
+    # terminar el request) — cero mantenimiento manual, cero "última fecha de
+    # uso" que llevar.
+    dispatch_locks: weakref.WeakValueDictionary[tuple[str | None, str], asyncio.Lock] = field(
+        default_factory=weakref.WeakValueDictionary
     )

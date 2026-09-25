@@ -93,13 +93,26 @@ rollback documentado (constraint `UNIQUE(wa_identity)` de vuelta) está al
 principio de `migrations/003_org.sql`.
 
 **Corte de un solo negocio a modo despacho** (p. ej. allok migrando su propio
-número): desplegar Nea con `RELAY_ONLY=true` justo cuando el CRM empiece a
-mandarle `NEA_DISPATCH_URL` — con esa bandera, `/webhook` sigue verificando
-firma, persistiendo y releando cada payload de Meta exactamente igual que
-hoy, pero deja de correr turnos (sin coalesce, sin "escribiendo…"): el CRM va
-a correr ESE turno por `/dispatch`. Sin el corte, durante la transición Nea
-contestaría el mismo mensaje dos veces. Detalle completo: `app/dispatch.py`,
-`app/webhook.py` y `.env.example`.
+número, que ya usaba esta MISMA Nea en modo legacy): dos banderas juntas, en
+el mismo deploy:
+
+1. `RELAY_ONLY=true` — `/webhook` sigue verificando firma, persistiendo y
+   releando cada payload de Meta exactamente igual que hoy, pero deja de
+   correr turnos (sin coalesce, sin "escribiendo…"): el CRM va a correr ESE
+   turno por `/dispatch`. Sin esto, durante la transición Nea contestaría el
+   mismo mensaje dos veces.
+2. `LEGACY_ORGANIZATION_ID=<id de esa organización en el CRM>` — esta Nea
+   tiene años de conversaciones con `organization_id` NULL (el namespace
+   legacy). Sin adoptarlas, el primer despacho de esa organización crearía
+   una conversación NUEVA y vacía para cada lead que YA le había escrito:
+   historial y `greeted` perdidos, y cualquier followup legacy que ya estaba
+   agendado sigue disparando por el `CrmClient` global en vez del de la
+   organización. Al arrancar (después de migrar), Nea adopta TODAS las filas
+   legacy hacia ese `organization_id` — una vez, de forma idempotente — y
+   loguea cuántas movió.
+
+Detalle completo: `app/dispatch.py`, `app/webhook.py`, `app/main.py`
+(`adopt_legacy_rows`) y `.env.example`.
 
 Despliegue de solo-despacho puro (esta Nea nunca recibe el webhook de Meta
 directamente): además de `RELAY_ONLY`, existe `DISPATCH_ONLY=true`, que deja

@@ -13,7 +13,7 @@ from typing import Any
 
 from app.crm import AgendaUnavailable, CrmError, SlotTaken
 from app.profile import BusinessProfile
-from app.state import AppContext, Conversation, OfferedSlot
+from app.state import AppContext, Conversation, OfferedSlot, TurnCommit
 
 logger = logging.getLogger("nea.tools")
 
@@ -188,11 +188,13 @@ class ToolRuntime:
         conv: Conversation,
         crm_conversation_id: str,
         profile: BusinessProfile | None = None,
+        commit: TurnCommit | None = None,
     ) -> None:
         self._ctx = ctx
         self._conv = conv
         self._crm_conv_id = crm_conversation_id
         self._profile = profile or BusinessProfile()
+        self._commit = commit
         # Efectos observables por turn.py:
         self.handoff_reason: str | None = None  # se ejecuta DESPUÉS de la despedida
         self.booked = False
@@ -298,6 +300,12 @@ class ToolRuntime:
                 "detalle": "solo puedes reservar un horario que ya ofreciste",
                 "slots_ofrecidos": _slots_for_llm(offered),
             }
+        # Marca el commit ANTES del intento, no después de un 201/200: incluso
+        # un intento que "falla" de nuestro lado (timeout, red) puede haber
+        # llegado al CRM, y reintentar el TURNO completo desde cero podría
+        # generar una segunda reserva o un mensaje de confirmación duplicado.
+        if self._commit is not None:
+            self._commit.mark()
         try:
             result = await (
                 self._ctx.crm.reschedule_booking(

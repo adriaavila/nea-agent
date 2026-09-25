@@ -29,15 +29,27 @@
 -- constraint de abajo ya no existe, así que un rollback de CÓDIGO sin
 -- rollback de MIGRACIÓN no arranca):
 --
---   1. Verificar que la promesa siga siendo cierta (ninguna identidad
---      compartida entre organizaciones — si esto devuelve filas, el rollback
---      pierde información: dos conversaciones de organizaciones distintas se
---      fusionarían en una al recrear el UNIQUE(wa_identity) global):
---        SELECT wa_identity FROM bot_conversation
---        GROUP BY wa_identity HAVING COUNT(DISTINCT organization_id) > 1;
+--   1. Verificar que la promesa siga siendo cierta: ninguna wa_identity debe
+--      tener más de UNA fila en bot_conversation, sea cual sea su
+--      organization_id (NULL incluido — es un valor de namespace más, no un
+--      comodín). Ojo: `COUNT(DISTINCT organization_id) > 1` NO sirve para
+--      esto — SQL excluye los NULL del conteo de un DISTINCT, así que una
+--      fila NULL (legacy) y una fila 'org_a' para la MISMA identidad
+--      contarían como "1 distinto" y el choque pasaría desapercibido. El
+--      chequeo correcto cuenta FILAS, no valores distintos:
+--        SELECT wa_identity, COUNT(*) FROM bot_conversation
+--        GROUP BY wa_identity HAVING COUNT(*) > 1;
+--      Si esto devuelve filas, el paso 3 de abajo NO va a funcionar solo —
+--      ver la nota al final de este bloque.
 --   2. DROP INDEX IF EXISTS uq_bot_conversation_org_identity;
 --   3. ALTER TABLE bot_conversation
 --        ADD CONSTRAINT bot_conversation_wa_identity_key UNIQUE (wa_identity);
+--      Si el paso 1 encontró duplicados, este ALTER TABLE FALLA con un error
+--      de violación de unicidad — Postgres NO fusiona las filas duplicadas
+--      por su cuenta ni pierde datos en silencio, simplemente rechaza el
+--      constraint. Hay que resolver el choque a mano primero (decidir qué
+--      fila de cada wa_identity duplicada conservar, migrar o borrar el
+--      resto) antes de que este paso pueda completarse.
 --   4. Las columnas organization_id pueden quedarse — el código viejo nunca
 --      las lee ni las escribe, así que no hace falta un DROP COLUMN.
 --

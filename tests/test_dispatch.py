@@ -17,7 +17,7 @@ from typing import Any
 import httpx
 
 from app.multiorg import profile_for
-from tests.conftest import CRM_URL, IDENTITY, crm_context, mock_crm_basics
+from tests.conftest import CRM_CONV_ID, CRM_URL, IDENTITY, crm_context, mock_crm_basics
 
 SECRET = "test-key"  # CRM_BOT_API_KEY por defecto en tests.conftest.make_settings
 
@@ -486,3 +486,278 @@ async def test_dispatch_istest_no_bool_400(client):
     body = json.dumps(payload).encode("utf-8")
     resp = await client.post("/dispatch", content=body, headers={"x-signature": sign(body)})
     assert resp.status_code == 400
+
+
+# ------------------------------------------- lote mixto (parcialmente dedup) ---
+
+
+async def test_dispatch_lote_mixto_libera_solo_los_ids_frescos(ctx, client, respx_mock):
+    """Un lote con un id YA procesado (por otra vía) y uno fresco: si el
+    turno falla, SOLO se libera el fresco — el viejo no era nuestro para
+    soltar y no hay que tocarlo."""
+    await ctx.store.mark_processed("wamid.mixed_old")
+    mock_crm_basics(respx_mock, conv_id="cv_mixed_1")
+    mock_profile_404(respx_mock)
+    ctx.llm.raise_exc = RuntimeError("boom")
+
+    payload = dispatch_payload(organization_id="org_a", conversation_id="cv_mixed_1")
+    payload["messages"] = [
+        {
+            "id": "wamid.mixed_old",
+            "type": "text",
+            "text": "primero",
+            "mediaId": None,
+            "timestamp": None,
+        },
+        {
+            "id": "wamid.mixed_new",
+            "type": "text",
+            "text": "segundo",
+            "mediaId": None,
+            "timestamp": None,
+        },
+    ]
+    body = json.dumps(payload).encode("utf-8")
+    resp = await client.post("/dispatch", content=body, headers={"x-signature": sign(body)})
+
+    assert resp.status_code == 500
+    assert "wamid.mixed_old" in ctx.store.processed  # no era nuestro: se queda
+    assert "wamid.mixed_new" not in ctx.store.processed  # liberado: sí lo reclamamos
+
+
+# --------------------------------------------------- doble respuesta (commit) ---
+
+
+async def test_dispatch_fallo_tras_enviar_no_reintenta_el_envio(ctx, client, respx_mock):
+    """CRÍTICO: si la respuesta YA salió (send_message tuvo éxito) y algo
+    revienta después (aquí: update_conversation), dispatch.py debe responder
+    200 en vez de 500 — un 500 haría que el CRM reintentara el MISMO job,
+    corriendo el LLM de nuevo y mandando una SEGUNDA respuesta real al lead."""
+    routes = mock_crm_basics(respx_mock, conv_id="cv_commit_1")
+    mock_profile_404(respx_mock)
+
+    original_update = ctx.store.update_conversation
+    calls = {"n": 0}
+
+    async def falla_en_la_segunda(conversation_id: Any, **fields: Any) -> Any:
+        calls["n"] += 1
+        if calls["n"] == 2:  # la llamada de "fase + seguimiento", tras el envío
+            raise RuntimeError("la DB se cayó justo después de mandar el mensaje")
+        return await original_update(conversation_id, **fields)
+
+    ctx.store.update_conversation = falla_en_la_segunda  # type: ignore[method-assign]
+
+    body = dispatch_body(
+        organization_id="org_a", conversation_id="cv_commit_1", wamid="wamid.commit1"
+    )
+    resp1 = await client.post("/dispatch", content=body, headers={"x-signature": sign(body)})
+    assert resp1.status_code == 200  # ¡200! ya se mandó la respuesta real
+    assert routes["messages"].call_count == 1
+
+    # El CRM cree que falló (nunca vio el 200 a tiempo) y reintenta el MISMO job.
+    resp2 = await client.post("/dispatch", content=body, headers={"x-signature": sign(body)})
+    assert resp2.status_code == 200
+    assert routes["messages"].call_count == 1  # el reintento NO volvió a mandar nada
+    assert len(ctx.llm.calls) == 1  # tampoco corrió el LLM de nuevo
+
+
+async def test_dispatch_timeout_tras_comprometerse_no_reintenta(
+    ctx, client, respx_mock, monkeypatch
+):
+    """El asyncio.shield: un timeout que llega DESPUÉS del commit no cancela
+    el turno — sigue corriendo en segundo plano — y dispatch.py responde 200
+    de inmediato en vez de dejar que el CRM reintente y duplique la respuesta."""
+    from app import dispatch as dispatch_module
+
+    monkeypatch.setattr(dispatch_module, "DISPATCH_TIMEOUT_SECONDS", 0.05)
+    routes = mock_crm_basics(respx_mock, conv_id="cv_postcommit_timeout_1")
+    mock_profile_404(respx_mock)
+
+    original_update = ctx.store.update_conversation
+    calls = {"n": 0}
+
+    async def lenta_tras_enviar(conversation_id: Any, **fields: Any) -> Any:
+        calls["n"] += 1
+        if calls["n"] == 2:
+            await asyncio.sleep(0.2)  # más lenta que el timeout, a propósito
+        return await original_update(conversation_id, **fields)
+
+    ctx.store.update_conversation = lenta_tras_enviar  # type: ignore[method-assign]
+
+    body = dispatch_body(
+        organization_id="org_a",
+        conversation_id="cv_postcommit_timeout_1",
+        wamid="wamid.pct1",
+    )
+    resp = await client.post("/dispatch", content=body, headers={"x-signature": sign(body)})
+
+    assert resp.status_code == 200  # NO 500: ya se había comprometido
+    assert routes["messages"].call_count == 1
+
+    await asyncio.sleep(0.3)  # deja correr la cola de fondo (shield)
+    assert calls["n"] == 2  # el turno SÍ terminó, solo que después de responder
+
+
+# ------------------------------------------------------------ perfil estricto ---
+
+
+async def test_dispatch_perfil_falla_en_primera_carga_es_5xx(ctx, client, respx_mock):
+    """IMPORTANTE: un fallo REAL del CRM en la primera carga del perfil de
+    esta organización (nunca hubo uno en caché) no puede degradar en
+    silencio al perfil mínimo genérico — mejor un 5xx reintentable que
+    contestarle a un lead sin saber si esa organización tiene reglas de
+    escalado que ese perfil mínimo se está saltando."""
+    mock_crm_basics(respx_mock, conv_id="cv_profile_fail_1")
+    respx_mock.get(f"{CRM_URL}/api/bot/profile").mock(return_value=httpx.Response(503))
+
+    body = dispatch_body(
+        organization_id="org_a", conversation_id="cv_profile_fail_1", wamid="wamid.pf1"
+    )
+    resp = await client.post("/dispatch", content=body, headers={"x-signature": sign(body)})
+    assert resp.status_code == 500
+    assert "wamid.pf1" not in ctx.store.processed  # liberado, el CRM puede reintentar
+
+
+async def test_dispatch_perfil_404_limpio_sigue_cayendo_al_minimo(ctx, client, respx_mock):
+    """Un 404 limpio (organización sin perfil configurado TODAVÍA) NO es un
+    error del CRM — sigue cayendo al perfil mínimo, incluso en modo
+    estricto (se mantiene la degradación de siempre)."""
+    routes = mock_crm_basics(respx_mock, conv_id="cv_profile_404_1")
+    respx_mock.get(f"{CRM_URL}/api/bot/profile").mock(return_value=httpx.Response(404))
+
+    body = dispatch_body(
+        organization_id="org_a", conversation_id="cv_profile_404_1", wamid="wamid.pf404"
+    )
+    resp = await client.post("/dispatch", content=body, headers={"x-signature": sign(body)})
+    assert resp.status_code == 200
+    assert routes["messages"].call_count == 1
+
+
+# ------------------------------------------------------------------- locks ---
+
+
+async def test_dispatch_lock_no_se_queda_pegado_tras_el_turno(ctx, client, respx_mock):
+    """MENOR: dispatch_locks es un WeakValueDictionary — sin referencias
+    fuertes vivas fuera del request, el Lock de esta (organización,
+    identidad) debe desaparecer solo al terminar, o cada lead que alguna vez
+    escribió deja un Lock vivo para siempre (fuga lenta)."""
+    mock_crm_basics(respx_mock, conv_id="cv_prune_1")
+    mock_profile_404(respx_mock)
+
+    body = dispatch_body(
+        organization_id="org_a", conversation_id="cv_prune_1", wamid="wamid.prune1"
+    )
+    resp = await client.post("/dispatch", content=body, headers={"x-signature": sign(body)})
+
+    assert resp.status_code == 200
+    assert len(ctx.dispatch_locks) == 0
+
+
+# ----------------------------------------------------------------- /reset ---
+
+
+async def test_reset_pasa_organization_id_a_pending_send_si_el_envio_falla(
+    ctx, client, respx_mock, monkeypatch
+):
+    """MENOR: si la confirmación de /reset no se puede mandar, el pending_send
+    encolado debe llevar el organization_id del despacho — con NULL, el
+    SenderWorker reintentaría con el CrmClient global, no el de la
+    organización."""
+    from app import turn as turn_module
+
+    async def sin_esperas(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(turn_module.asyncio, "sleep", sin_esperas)
+
+    ctx.settings.allowed_wa_ids = IDENTITY  # /reset exige allowlist (legacy)
+    mock_crm_basics(respx_mock, conv_id="cv_reset_pending_1")
+    mock_profile_404(respx_mock)
+    respx_mock.post(f"{CRM_URL}/api/bot/reset").mock(
+        return_value=httpx.Response(200, json={"ok": True})
+    )
+    respx_mock.post(f"{CRM_URL}/api/bot/messages").mock(
+        return_value=httpx.Response(502, json={"code": "meta_unavailable"})
+    )
+
+    body = dispatch_body(
+        organization_id="org_a",
+        conversation_id="cv_reset_pending_1",
+        identity=IDENTITY,
+        text="/reset",
+        wamid="wamid.resetpending1",
+    )
+    resp = await client.post("/dispatch", content=body, headers={"x-signature": sign(body)})
+
+    assert resp.status_code == 200
+    assert len(ctx.store.pending_sends) == 1
+    pending = next(iter(ctx.store.pending_sends.values()))
+    assert pending.organization_id == "org_a"
+
+
+# ------------------------------------------------------- cutover / adopción ---
+
+
+async def test_legacy_organization_id_adopta_conversaciones_del_namespace_legacy(
+    ctx, client, respx_mock
+):
+    """Cutover: una conversación legacy (organization_id NULL) adoptada vía
+    adopt_legacy_rows debe ser la MISMA que usa el modo despacho para esa
+    identidad — no una nueva, vacía, sin greeted ni historial."""
+    legacy_conv = await ctx.store.get_or_create_conversation(IDENTITY)
+    await ctx.store.add_message(legacy_conv.id, "user", "hola, ya hablamos antes")
+    await ctx.store.add_message(legacy_conv.id, "assistant", "sí, claro, ¿en qué te ayudo?")
+    await ctx.store.update_conversation(legacy_conv.id, greeted=True)
+
+    moved_conv, moved_pending = await ctx.store.adopt_legacy_rows("org_a")
+    assert (moved_conv, moved_pending) == (1, 0)
+
+    mock_crm_basics(respx_mock, conv_id="cv_cutover_1")
+    mock_profile_404(respx_mock)
+    body = dispatch_body(
+        organization_id="org_a",
+        conversation_id="cv_cutover_1",
+        identity=IDENTITY,
+        wamid="wamid.cutover1",
+    )
+    resp = await client.post("/dispatch", content=body, headers={"x-signature": sign(body)})
+    assert resp.status_code == 200
+
+    convs = list(ctx.store.conversations.values())
+    assert len(convs) == 1  # la MISMA conversación — no una nueva
+    adopted = convs[0]
+    assert adopted.id == legacy_conv.id
+    assert adopted.organization_id == "org_a"
+    assert adopted.greeted is True  # se conservó
+    history = [m.content for m in ctx.store.messages if m.conversation_id == adopted.id]
+    assert "hola, ya hablamos antes" in history  # el historial se conservó
+
+
+async def test_adopt_legacy_rows_mueve_pending_send_y_es_idempotente(ctx):
+    conv = await ctx.store.get_or_create_conversation(IDENTITY)
+    await ctx.store.enqueue_pending_send(conv.id, CRM_CONV_ID, "pendiente viejo")
+
+    moved_conv, moved_pending = await ctx.store.adopt_legacy_rows("org_a")
+    assert (moved_conv, moved_pending) == (1, 1)
+    pending = next(iter(ctx.store.pending_sends.values()))
+    assert pending.organization_id == "org_a"
+
+    # Un segundo arranque no encuentra nada NULL que mover.
+    moved_conv2, moved_pending2 = await ctx.store.adopt_legacy_rows("org_a")
+    assert (moved_conv2, moved_pending2) == (0, 0)
+
+
+async def test_adopt_legacy_rows_no_toca_conversaciones_ya_de_otra_organizacion(ctx):
+    """Una conversación que YA pertenece a otra organización (o a esta misma,
+    de una adopción anterior) no debe reasignarse por una segunda corrida con
+    un organization_id distinto."""
+    await ctx.store.get_or_create_conversation(IDENTITY, organization_id="org_b")
+    legacy = await ctx.store.get_or_create_conversation("otra-identidad")
+
+    moved_conv, _ = await ctx.store.adopt_legacy_rows("org_a")
+    assert moved_conv == 1
+
+    convs = {c.wa_identity: c.organization_id for c in ctx.store.conversations.values()}
+    assert convs[IDENTITY] == "org_b"  # intacta
+    assert convs["otra-identidad"] == "org_a"  # la única legacy, adoptada
+    assert legacy.organization_id == "org_a"
