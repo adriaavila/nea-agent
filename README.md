@@ -61,6 +61,67 @@ Herramientas del LLM: `update_ficha` (calificación), `propose_slots` /
 comparte los recursos alternativos del perfil), `handoff` (pausa la IA en el
 CRM).
 
+### Modo de despacho multi-organización (Vocero multitenant)
+
+Con un Vocero multitenant, el camino se invierte: el CRM recibe el webhook de
+Meta de TODAS sus organizaciones, lo guarda, hace su propio debounce, y le
+despacha el turno ya armado a una Nea COMPARTIDA:
+
+```
+Meta Cloud API ── webhook ──► Vocero CRM (multitenant)
+                               │  guarda, debounce
+                               └─ POST {NEA}/dispatch (firmado, síncrono) ──► Nea
+                                  │  X-Organization-Id en cada /api/bot/* de vuelta
+                                  └─ envía vía POST {CRM}/api/bot/messages
+```
+
+`POST /dispatch` se monta SIEMPRE junto al webhook de Meta de siempre — no hay
+bandera de modo, y `organization_id` NULL es exactamente el camino legacy de
+un solo negocio (un despliegue de un solo negocio no cambia en nada). Cada
+organización tiene su propio `CrmClient`/`BusinessProfile` cacheados
+(`app/multiorg.py`, NUNCA el `BRIEF_PATH` del despliegue): el perfil de una
+JAMÁS se sirve a otra. Sin coalesce (el CRM ya agrupó la ráfaga) y sin relay
+(el CRM ya tiene el mensaje) — el turno corre síncrono dentro del request
+(con un timeout propio y un lock por conversación, ver `app/dispatch.py`) y
+responde 200 solo al terminar (5xx si revienta o se cuelga, liberando los ids
+reclamados para que el reintento del CRM no los encuentre "ya procesados").
+
+**nea-santorini (producción, single-tenant) corre la rama `main`, NO esta
+rama** — la migración `003_org.sql` y el modo despacho todavía no la tocan.
+Cuando ese despliegue sí actualice a un commit con esta migración, el
+rollback documentado (constraint `UNIQUE(wa_identity)` de vuelta) está al
+principio de `migrations/003_org.sql`.
+
+**Corte de un solo negocio a modo despacho** (p. ej. allok migrando su propio
+número, que ya usaba esta MISMA Nea en modo legacy): dos banderas juntas, en
+el mismo deploy:
+
+1. `RELAY_ONLY=true` — `/webhook` sigue verificando firma, persistiendo y
+   releando cada payload de Meta exactamente igual que hoy, pero deja de
+   correr turnos (sin coalesce, sin "escribiendo…"): el CRM va a correr ESE
+   turno por `/dispatch`. Sin esto, durante la transición Nea contestaría el
+   mismo mensaje dos veces.
+2. `LEGACY_ORGANIZATION_ID=<id de esa organización en el CRM>` — esta Nea
+   tiene años de conversaciones con `organization_id` NULL (el namespace
+   legacy). Sin adoptarlas, el primer despacho de esa organización crearía
+   una conversación NUEVA y vacía para cada lead que YA le había escrito:
+   historial y `greeted` perdidos, y cualquier followup legacy que ya estaba
+   agendado sigue disparando por el `CrmClient` global en vez del de la
+   organización. Al arrancar (después de migrar), Nea adopta TODAS las filas
+   legacy hacia ese `organization_id` — una vez, de forma idempotente — y
+   loguea cuántas movió.
+
+Detalle completo: `app/dispatch.py`, `app/webhook.py`, `app/main.py`
+(`adopt_legacy_rows`) y `.env.example`.
+
+Despliegue de solo-despacho puro (esta Nea nunca recibe el webhook de Meta
+directamente): además de `RELAY_ONLY`, existe `DISPATCH_ONLY=true`, que deja
+arrancar sin `META_APP_SECRET` — sin la bandera explícita, el arranque con
+persistencia sigue exigiendo el secreto SIEMPRE (`CRM_BOT_API_KEY` no cuenta:
+lo tiene cualquier despliegue normal, así que por sí sola dejaría arrancar en
+verde a un despliegue clásico que se quedó sin secreto, y Meta empezaría a
+recibir 401 sin que nada avise).
+
 ### La agenda, contra el motor universal del CRM (Vocero 015)
 
 `propose_slots` no solo consulta: **registra**. `GET /api/bot/availability`

@@ -21,6 +21,7 @@ from app.coalesce import Coalescer
 from app.config import Settings
 from app.crm import CrmClient
 from app.db import PgStore
+from app.dispatch import router as dispatch_router
 from app.followup import FollowupWorker
 from app.llm import OpenAiLlm
 from app.profile import ProfileProvider
@@ -53,13 +54,45 @@ def create_app(ctx: AppContext | None = None) -> FastAPI:
         if own_resources:
             settings = Settings()
             if settings.database_url and not settings.meta_app_secret:
-                raise RuntimeError(
-                    "META_APP_SECRET es obligatorio con persistencia habilitada"
+                if not settings.dispatch_only:
+                    # CRM_BOT_API_KEY casi siempre está configurado (TODO
+                    # despliegue de un solo negocio también le habla al CRM),
+                    # así que NO basta como señal de "esto es solo-despacho" —
+                    # un despliegue clásico que se quedó sin META_APP_SECRET
+                    # arrancaría en verde y le respondería 401 a cada entrega
+                    # de Meta sin que nada avise. DISPATCH_ONLY tiene que ser
+                    # explícito.
+                    raise RuntimeError(
+                        "META_APP_SECRET es obligatorio con persistencia habilitada, "
+                        "salvo que DISPATCH_ONLY=true (despliegue de solo-despacho: "
+                        "/webhook queda deshabilitado y solo corre /dispatch)"
+                    )
+                logger.warning(
+                    "DISPATCH_ONLY=true sin META_APP_SECRET: /webhook va a "
+                    "RECHAZAR TODAS las peticiones de Meta con 401 — esta "
+                    "instancia solo atiende /dispatch. Si esto es un "
+                    "despliegue de UN solo negocio, es una falla silenciosa: "
+                    "revisa META_APP_SECRET/DISPATCH_ONLY ahora."
                 )
             store = PgStore(settings.database_url)
             await store.connect()
             await store.migrate(MIGRATIONS_DIR)
             logger.info("migraciones aplicadas — DB lista")
+            if settings.legacy_organization_id:
+                # Cutover: adopta las filas que quedaron en el namespace
+                # legacy (organization_id NULL) hacia esta organización.
+                # Idempotente — en arranques posteriores no hay nada NULL que
+                # mover y esto es un no-op instantáneo.
+                moved_conv, moved_pending = await store.adopt_legacy_rows(
+                    settings.legacy_organization_id
+                )
+                logger.warning(
+                    "LEGACY_ORGANIZATION_ID=%s: %d conversaciones y %d "
+                    "pending_send adoptados del namespace legacy",
+                    settings.legacy_organization_id,
+                    moved_conv,
+                    moved_pending,
+                )
             crm = CrmClient(settings.crm_base_url, settings.crm_bot_api_key)
             app.state.ctx = AppContext(
                 settings=settings,
@@ -102,6 +135,11 @@ def create_app(ctx: AppContext | None = None) -> FastAPI:
             await relay_worker.aclose()
             if c.coalescer is not None:
                 await c.coalescer.aclose()
+            # Los CrmClient por organización (modo despacho, app/multiorg.py)
+            # los abre este proceso bajo demanda — nadie más los cierra, a
+            # diferencia del `c.crm` legacy que en tests gestiona el fixture.
+            for org_crm in c.crm_clients.values():
+                await org_crm.aclose()
             if own_resources:
                 await c.crm.aclose()
                 await c.store.aclose()
@@ -111,6 +149,7 @@ def create_app(ctx: AppContext | None = None) -> FastAPI:
     if ctx is not None:
         _wire_coalescer(ctx)
     app.include_router(webhook_router)
+    app.include_router(dispatch_router)
 
     @app.get("/health")
     async def health(request: Request):  # type: ignore[no-untyped-def]

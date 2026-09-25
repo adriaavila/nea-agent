@@ -11,7 +11,7 @@ from tests.conftest import CRM_CONV_ID, IDENTITY, mock_crm_basics, wa_body
 
 
 class ActivationProfile:
-    async def get(self):
+    async def get(self, *, strict: bool = False):
         return BusinessProfile(
             activation_enabled=True,
             activation_messages=("Quiero agendar",),

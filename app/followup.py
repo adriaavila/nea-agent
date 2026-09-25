@@ -14,6 +14,7 @@ from typing import Any
 
 from app.crm import CrmConflict, CrmError
 from app.llm import LlmExhausted
+from app.multiorg import scoped_ctx
 from app.profile import resolve_profile
 from app.prompt import FOLLOWUP_INSTRUCTION, build_system_prompt
 from app.state import AppContext, Conversation, utcnow
@@ -51,9 +52,21 @@ class FollowupWorker:
                 )
 
     async def _push(self, conv: Conversation) -> None:
-        ctx = self._ctx
+        # La organización de la conversación decide con QUIÉN habla el CRM:
+        # None = camino legacy (ctx.crm de siempre); con valor, el CrmClient
+        # cacheado de esa organización (nunca el global — X-Organization-Id
+        # importa en cada llamada de este empujón).
+        ctx = scoped_ctx(self._ctx, conv.organization_id)
         try:
-            context = await ctx.crm.get_context(conv.wa_identity)
+            if conv.organization_id is not None:
+                # Modo despacho: el CRM enruta por conversationId — no hay
+                # una identidad real que buscar (conversaciones de prueba del
+                # Laboratorio incluidas).
+                context = await ctx.crm.get_context(
+                    conversation_id=conv.crm_conversation_id
+                )
+            else:
+                context = await ctx.crm.get_context(conv.wa_identity)
         except CrmError as exc:
             logger.warning("followup %s: CRM inaccesible (%s) — omitido", conv.wa_identity, exc)
             return

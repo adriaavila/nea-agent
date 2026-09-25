@@ -103,11 +103,16 @@ def profile_from_brief(path: Path, default_name: str) -> BusinessProfile | None:
     return BusinessProfile(agent_name=default_name, instructions=text)
 
 
-async def resolve_profile(ctx: Any) -> BusinessProfile:
-    """Perfil vigente desde el AppContext; sin provider (tests) = mínimo."""
+async def resolve_profile(ctx: Any, *, strict: bool = False) -> BusinessProfile:
+    """Perfil vigente desde el AppContext; sin provider (tests) = mínimo.
+
+    `strict=True` (modo despacho, ver ProfileProvider.get) deja que un fallo
+    real del CRM en la PRIMERA carga de esta organización se propague en vez
+    de contestar con el perfil mínimo genérico sin saber si esa organización
+    tiene reglas de escalado que ese perfil se salta."""
     if getattr(ctx, "profile", None) is None:
         return BusinessProfile(agent_name=getattr(ctx.settings, "agent_name", "Nea"))
-    return await ctx.profile.get()
+    return await ctx.profile.get(strict=strict)
 
 
 class ProfileProvider:
@@ -129,15 +134,24 @@ class ProfileProvider:
         self._fetched_at: float = 0.0
         self._warned_minimal = False
 
-    async def get(self) -> BusinessProfile:
+    async def get(self, *, strict: bool = False) -> BusinessProfile:
+        """`strict=True`: si esta es la carga de perfil de esta organización y
+        el CRM realmente falló (no un 404 limpio de "sin perfil configurado
+        todavía"), propaga el error en vez de degradar al mínimo — lo
+        maneja `app/dispatch.py`, convirtiéndolo en 5xx. Con un perfil ya
+        conocido en caché, la degradación de siempre sigue aplicando: un CRM
+        caído a media conversación no debe tumbar un turno que ya sabía
+        hablar de este negocio."""
         now = time.monotonic()
         if self._cached is not None and (now - self._fetched_at) < self._ttl:
             return self._cached
 
         payload = None
+        crm_error: CrmError | None = None
         try:
             payload = await self._crm.get_profile()
         except CrmError as exc:
+            crm_error = exc
             logger.warning("perfil: el CRM no respondió (%s) — uso el último conocido", exc)
         except AttributeError:
             payload = None  # cliente sin get_profile (tests viejos): fallback
@@ -151,6 +165,8 @@ class ProfileProvider:
         if self._cached is not None:
             self._fetched_at = now  # no martillar al CRM caído en cada turno
             return self._cached
+        if strict and crm_error is not None:
+            raise crm_error
         if self._brief_path is not None:
             brief = profile_from_brief(self._brief_path, self._default_name)
             if brief is not None:

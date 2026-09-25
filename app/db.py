@@ -28,6 +28,15 @@ _CONV_COLUMNS = frozenset(
 )
 
 
+def _rows_affected(command_status: str) -> int:
+    """asyncpg devuelve el status crudo de Postgres ("UPDATE 3") en vez del
+    conteo — el número siempre es el último token."""
+    try:
+        return int(command_status.split()[-1])
+    except (ValueError, IndexError):
+        return 0
+
+
 def _conv_from_row(row: asyncpg.Record) -> Conversation:
     return Conversation(
         id=row["id"],
@@ -39,6 +48,7 @@ def _conv_from_row(row: asyncpg.Record) -> Conversation:
         followup_due_at=row["followup_due_at"],
         followup_sent=row["followup_sent"],
         last_inbound_at=row["last_inbound_at"],
+        organization_id=row["organization_id"],
     )
 
 
@@ -78,6 +88,14 @@ class PgStore:
             wa_message_id,
         )
         return row is not None
+
+    async def release_processed(self, wa_message_ids: list[str]) -> None:
+        if not wa_message_ids:
+            return
+        await self.pool.execute(
+            "DELETE FROM processed_message WHERE wa_message_id = ANY($1::text[])",
+            wa_message_ids,
+        )
 
     # -------------------------------------------------------------- relay ---
 
@@ -136,14 +154,23 @@ class PgStore:
 
     # ----------------------------------------------------- conversaciones ---
 
-    async def get_or_create_conversation(self, wa_identity: str) -> Conversation:
+    async def get_or_create_conversation(
+        self, wa_identity: str, organization_id: str | None = None
+    ) -> Conversation:
+        # El arbitraje del ON CONFLICT usa la MISMA expresión que el índice
+        # único de la migración 003 (COALESCE(organization_id, '')): NULL no
+        # sirve como arbitraje porque en Postgres dos NULL nunca son iguales
+        # entre sí dentro de un índice único.
         row = await self.pool.fetchrow(
             """
-            INSERT INTO bot_conversation (wa_identity) VALUES ($1)
-            ON CONFLICT (wa_identity) DO UPDATE SET updated_at = now()
+            INSERT INTO bot_conversation (wa_identity, organization_id)
+            VALUES ($1, $2)
+            ON CONFLICT ((COALESCE(organization_id, '')), wa_identity)
+            DO UPDATE SET updated_at = now()
             RETURNING *
             """,
             wa_identity,
+            organization_id,
         )
         assert row is not None
         return _conv_from_row(row)
@@ -273,16 +300,22 @@ class PgStore:
     # ------------------------------------------------- envíos pendientes ---
 
     async def enqueue_pending_send(
-        self, conversation_id: int, crm_conversation_id: str, content: str
+        self,
+        conversation_id: int,
+        crm_conversation_id: str,
+        content: str,
+        organization_id: str | None = None,
     ) -> int:
         row = await self.pool.fetchrow(
             """
-            INSERT INTO pending_send (conversation_id, crm_conversation_id, content)
-            VALUES ($1, $2, $3) RETURNING id
+            INSERT INTO pending_send
+                (conversation_id, crm_conversation_id, content, organization_id)
+            VALUES ($1, $2, $3, $4) RETURNING id
             """,
             conversation_id,
             crm_conversation_id,
             content,
+            organization_id,
         )
         assert row is not None
         return row["id"]
@@ -308,6 +341,7 @@ class PgStore:
                 next_retry_at=r["next_retry_at"],
                 delivered_at=r["delivered_at"],
                 abandoned_at=r["abandoned_at"],
+                organization_id=r["organization_id"],
             )
             for r in rows
         ]
@@ -371,6 +405,22 @@ class PgStore:
             conversation_id,
         )
         return row is not None
+
+    # ------------------------------------------------- corte a despacho ---
+
+    async def adopt_legacy_rows(self, organization_id: str) -> tuple[int, int]:
+        """Idempotente: la segunda corrida (siguiente arranque) no encuentra
+        NULL que adoptar y devuelve (0, 0). La tabla es la fuente de verdad
+        (a diferencia de MemoryStore no hay índice aparte que reindexar)."""
+        conv_status = await self.pool.execute(
+            "UPDATE bot_conversation SET organization_id = $1 WHERE organization_id IS NULL",
+            organization_id,
+        )
+        pending_status = await self.pool.execute(
+            "UPDATE pending_send SET organization_id = $1 WHERE organization_id IS NULL",
+            organization_id,
+        )
+        return _rows_affected(conv_status), _rows_affected(pending_status)
 
     # --------------------------------------------------------------- misc ---
 

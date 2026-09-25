@@ -89,6 +89,42 @@ async def test_followup_no_aplica_a_conversacion_cerrada(respx_mock):
     await ctx.crm.aclose()
 
 
+async def test_followup_usa_el_client_de_la_organizacion(respx_mock):
+    """Una conversación con organization_id (modo despacho) debe empujarse
+    con el CrmClient de ESA organización — header X-Organization-Id incluido
+    — y buscar el contexto por conversationId, no por waIdentity."""
+    ctx = make_ctx()
+    conv = await ctx.store.get_or_create_conversation(IDENTITY, organization_id="org_a")
+    await ctx.store.add_message(conv.id, "user", "me interesa, luego te digo")
+    await ctx.store.add_message(conv.id, "assistant", "va, ¿mañana o pasado?")
+    await ctx.store.update_conversation(
+        conv.id,
+        crm_conversation_id=CRM_CONV_ID,
+        greeted=True,
+        followup_due_at=utcnow() - timedelta(hours=1),
+    )
+    ctx.llm.replies = [LlmReply(content="¿seguimos donde nos quedamos?")]
+
+    context_route = respx_mock.get(
+        f"{CRM_URL}/api/bot/context", headers={"x-organization-id": "org_a"}
+    ).mock(return_value=httpx.Response(200, json=crm_context()))
+    respx_mock.get(
+        f"{CRM_URL}/api/bot/profile", headers={"x-organization-id": "org_a"}
+    ).mock(return_value=httpx.Response(404))
+    messages_route = respx_mock.post(
+        f"{CRM_URL}/api/bot/messages", headers={"x-organization-id": "org_a"}
+    ).mock(return_value=httpx.Response(200, json={"messageId": "m1"}))
+    worker = FollowupWorker(ctx)
+
+    await worker.tick()
+
+    assert context_route.call_count == 1
+    assert messages_route.call_count == 1
+    await ctx.crm.aclose()
+    for org_crm in ctx.crm_clients.values():
+        await org_crm.aclose()
+
+
 async def test_followup_llm_caido_se_omite_sin_reintento_futuro(respx_mock):
     from app.llm import LlmExhausted
 
