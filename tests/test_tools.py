@@ -154,3 +154,91 @@ async def test_crm_caido_en_tool_no_tumba_el_turno(runtime_y_ctx, respx_mock):
     result = await runtime.execute("update_ficha", {"rubro": "ferretería"})
     assert result["ok"] is False
     assert result["error"] == "crm_error"
+
+
+# ---------------------------------------------- reintento tras reserva viva ---
+# PR 2B, revisión: create_booking 201 pero el envío de la confirmación nunca
+# llegó (v2 no tiene pending_send que lo rescate) → el turno se reintenta
+# ENTERO con un catálogo de horarios NUEVO, que ya no ofrece el que se acaba
+# de ocupar. Sin `already_booked`, book_session lo rechazaría como
+# "no ofrecido" e intentaría reservar una SEGUNDA vez.
+
+
+async def test_book_session_sobre_lo_ya_agendado_es_idempotente_sin_tocar_el_crm():
+    from app.tools import AlreadyBooked
+
+    ctx = make_ctx()
+    conv = await ctx.store.get_or_create_conversation(IDENTITY)
+    # Catálogo de ESTE intento vacío a propósito: el horario ya está ocupado,
+    # el CRM no lo re-ofrece.
+    runtime = ToolRuntime(
+        ctx,
+        conv,
+        CRM_CONV_ID,
+        already_booked=AlreadyBooked(
+            start_utc=SLOT_DT, label="lunes 20 de julio, 10:00 am", meeting_url="https://zoom.us/j/1"
+        ),
+    )
+    result = await runtime.execute("book_session", {"start_utc": SLOT_ISO})
+    assert result["ok"] is True
+    assert result["label"] == "lunes 20 de julio, 10:00 am"
+    assert result["meeting_url"] == "https://zoom.us/j/1"
+    assert runtime.booked is True
+    await ctx.crm.aclose()
+
+
+async def test_book_session_sobre_otro_horario_distinto_al_ya_agendado_sigue_rechazando(
+    respx_mock,
+):
+    """`already_booked` no es un pase libre: SOLO protege el horario exacto
+    que ya está agendado — cualquier otro sigue exigiendo estar ofrecido."""
+    from app.tools import AlreadyBooked
+
+    ctx = make_ctx()
+    conv = await ctx.store.get_or_create_conversation(IDENTITY)
+    bookings = respx_mock.post(f"{CRM_URL}/api/bot/bookings").mock(
+        return_value=httpx.Response(201, json={"bookingId": "bk_1", "label": "x"})
+    )
+    runtime = ToolRuntime(
+        ctx,
+        conv,
+        CRM_CONV_ID,
+        already_booked=AlreadyBooked(start_utc=SLOT_DT, label="lunes 10am", meeting_url=None),
+    )
+    otro_horario = "2026-07-21T16:00:00Z"  # un día distinto al ya agendado
+    result = await runtime.execute("book_session", {"start_utc": otro_horario})
+    assert result["ok"] is False
+    assert result["error"] == "slot_no_ofrecido"
+    assert bookings.call_count == 0
+    await ctx.crm.aclose()
+
+
+async def test_reschedule_sobre_lo_ya_agendado_tambien_es_idempotente():
+    """El mismo camino cubre reschedule_session: si el reintento pide mover
+    a un horario que YA es el vigente (la mudanza anterior sí llegó al CRM),
+    confirma sin volver a llamarlo."""
+    from app.tools import AlreadyBooked
+
+    ctx = make_ctx()
+    conv = await ctx.store.get_or_create_conversation(IDENTITY)
+    runtime = ToolRuntime(
+        ctx,
+        conv,
+        CRM_CONV_ID,
+        already_booked=AlreadyBooked(start_utc=SLOT_DT, label="lunes 10am", meeting_url=None),
+    )
+    result = await runtime.execute("reschedule_session", {"start_utc": SLOT_ISO})
+    assert result["ok"] is True
+    assert result["movida"] is True
+
+
+async def test_v1_sin_already_booked_se_comporta_igual_que_siempre(runtime_y_ctx, respx_mock):
+    """v1/legacy nunca pasa `already_booked` (default None): un horario no
+    ofrecido sigue rechazándose exactamente como antes — sin este parámetro
+    nuevo, nada cambia para el camino de siempre."""
+    runtime, ctx, conv = runtime_y_ctx
+    result = await runtime.execute(
+        "book_session", {"start_utc": "2026-07-20T17:00:00Z"}  # nunca ofrecido
+    )
+    assert result["ok"] is False
+    assert result["error"] == "slot_no_ofrecido"

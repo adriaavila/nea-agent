@@ -30,14 +30,25 @@ class LlmExhausted(Exception):
     """El LLM falló todos los reintentos — el turno debe degradar en silencio."""
 
 
-class LlmAuthFailed(Exception):
+class LlmAuthFailed(LlmExhausted):
     """401: la clave del proveedor no sirve. Sin reintento — el llamador decide
-    el fallback a la clave de la plataforma."""
+    el fallback a la clave de la plataforma.
+
+    Subclase de `LlmExhausted` a propósito: app/turn.py (v1/legacy) solo
+    atrapa `LlmExhausted` alrededor de `_tool_loop` — sin esta herencia, un
+    401/402/429 contra la clave de la plataforma (que hoy SÍ puede pasar,
+    nadie está a salvo de una clave que vence) escaparía sin degradar
+    (silencio + handoff `error`, fase `cerrada`), rompiendo el camino legacy.
+    app/stateless.py (v2) sigue distinguiéndola con su propio
+    `except (LlmAuthFailed, LlmNoCredits)`, evaluado ANTES de llegar a
+    cualquier `except LlmExhausted` más externo — el orden de los `except`
+    de Python ya lo garantiza, esta herencia no lo cambia."""
 
 
-class LlmNoCredits(Exception):
+class LlmNoCredits(LlmExhausted):
     """402, o 429 con código `insufficient_quota`: sin crédito. Sin reintento —
-    el llamador decide el fallback a la clave de la plataforma."""
+    el llamador decide el fallback a la clave de la plataforma. Ver el
+    docstring de `LlmAuthFailed`: misma razón para heredar de `LlmExhausted`."""
 
 
 @dataclass
@@ -118,16 +129,28 @@ class OpenAiLlm:
         base_url: str | None = None,
         *,
         openai_api_key: str | None = None,
+        max_retries: int | None = None,
     ) -> None:
         # base_url ≠ None → proveedor OpenAI-compatible (p. ej. OpenRouter,
         # para el bench de modelos del 002 y para la clave por negocio del
-        # despacho v2). `max_retries=0`: el SDK reintenta 429/5xx por su
-        # cuenta (2 veces, por default) ANTES de que este código vea la
-        # excepción — sin apagarlo, un fallo "agotado" hace 3 (SDK) x 3
-        # (RETRIES de aquí) = 9 llamadas HTTP reales, no las ~2-3 que dicen
-        # los comentarios y el presupuesto de 75 s del despacho (app/dispatch.py).
-        # El único reintento que existe es el de este módulo, con SU backoff.
-        self._client = AsyncOpenAI(api_key=api_key, base_url=base_url, max_retries=0)
+        # despacho v2).
+        #
+        # `max_retries`: el SDK reintenta 429/5xx por su cuenta (2 veces, por
+        # default) ANTES de que este código vea la excepción — sin apagarlo,
+        # un fallo "agotado" hace 3 (SDK) x 3 (RETRIES de aquí) = 9 llamadas
+        # HTTP reales, no las ~2-3 que dicen los comentarios. `None` (default)
+        # deja el default del SDK intacto — es lo que usa el cliente
+        # COMPARTIDO de plataforma (app/main.py): v1/legacy no cambia de
+        # comportamiento con este PR. `0` es lo que pasa app/stateless.py al
+        # construir el cliente POR TURNO de un negocio — ahí sí importa: el
+        # despacho entero tiene 75 s (app/dispatch.DISPATCH_TIMEOUT_SECONDS) y
+        # una clave rota reintentando 9 veces se come ese presupuesto por las
+        # puras. El guardia de 75 s protege a los DOS casos igual si algo se
+        # escapa; esto es solo para no desperdiciarlo en el camino más común.
+        client_kwargs: dict[str, Any] = {"api_key": api_key, "base_url": base_url}
+        if max_retries is not None:
+            client_kwargs["max_retries"] = max_retries
+        self._client = AsyncOpenAI(**client_kwargs)
         self._model = model
         self._transcribe_model = transcribe_model
         # Transcripción: SIEMPRE con credenciales de la plataforma, nunca las
@@ -141,7 +164,10 @@ class OpenAiLlm:
         if base_url is None:
             self._whisper_client: AsyncOpenAI | None = self._client
         elif openai_api_key:
-            self._whisper_client = AsyncOpenAI(api_key=openai_api_key, max_retries=0)
+            whisper_kwargs: dict[str, Any] = {"api_key": openai_api_key}
+            if max_retries is not None:
+                whisper_kwargs["max_retries"] = max_retries
+            self._whisper_client = AsyncOpenAI(**whisper_kwargs)
         else:
             self._whisper_client = None
         # Modelo que OYE cuando se transcribe por chat: un `proveedor/modelo`

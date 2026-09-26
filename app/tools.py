@@ -8,6 +8,7 @@ turno.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Protocol
 
@@ -65,6 +66,23 @@ class MemoryOfferBook:
 
     async def clear(self) -> None:
         self._slots = []
+
+
+@dataclass
+class AlreadyBooked:
+    """La cita YA agendada de este lead, tal como la trae `context.booking.next`
+    del despacho v2 (`{scheduledAtUtc, label, meetingLink}`). Existe para un
+    caso puntual pero real: `create_booking` respondió 201 pero el envío de
+    la confirmación agotó sus reintentos (v2 no tiene `pending_send` que la
+    rescate — ver app/stateless._send) y el turno completo se reintenta. En
+    ESE reintento, el catálogo de horarios ofrecidos (`OfferBook`) es nuevo y
+    ya NO trae el horario reservado — sin esto, `_book_session` lo rechazaría
+    como "no ofrecido" e intentaría reservar una SEGUNDA vez."""
+
+    start_utc: datetime
+    label: str
+    meeting_url: str | None = None
+
 
 TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
@@ -237,6 +255,7 @@ class ToolRuntime:
         profile: BusinessProfile | None = None,
         commit: TurnCommit | None = None,
         offers: OfferBook | None = None,
+        already_booked: AlreadyBooked | None = None,
     ) -> None:
         self._ctx = ctx
         self._conv = conv
@@ -251,6 +270,10 @@ class ToolRuntime:
         # Solo para ESTAMPAR OfferedSlot.conversation_id (metadato informativo
         # de _slots_from_payload; las búsquedas reales van por self._offers).
         self._conv_id_for_slots = conv_id
+        # None salvo en v2 (ver AlreadyBooked): la cita YA agendada de este
+        # lead, para reconocer un book_session/reschedule_session repetido
+        # sobre ESE mismo horario como éxito idempotente, no como error.
+        self._already_booked = already_booked
         # Efectos observables por turn.py:
         self.handoff_reason: str | None = None  # se ejecuta DESPUÉS de la despedida
         self.booked = False
@@ -346,6 +369,34 @@ class ToolRuntime:
             None,
         )
         if chosen is None:
+            already = self._already_booked
+            if already is not None and int(already.start_utc.timestamp()) == int(
+                wanted.timestamp()
+            ):
+                # Reintento tras un envío de confirmación que nunca llegó: la
+                # reserva YA existe (create_booking/reschedule_booking del
+                # CRM son idempotentes por conversación+startUtc) y este
+                # catálogo — nuevo en este intento — no la re-ofrece porque
+                # ya está ocupada. Éxito idempotente, SIN tocar el CRM de
+                # nuevo: nunca un segundo intento de reservar el mismo hueco.
+                logger.info(
+                    "tools: %s ya está agendado (context.booking.next) — "
+                    "éxito idempotente, sin reservar de nuevo",
+                    args.get("start_utc"),
+                )
+                self.booked = True
+                return {
+                    "ok": True,
+                    "label": already.label,
+                    "meeting_url": already.meeting_url,
+                    "link_pendiente": False,
+                    "movida": mover,
+                    "instrucciones": (
+                        "confirma día y hora de la cita y menciona lo que el "
+                        "negocio pida para llegar preparado. Si hay "
+                        "meeting_url, compártelo."
+                    ),
+                }
             logger.info(
                 "tools: book_session rechazado — %s no está entre los ofrecidos",
                 args.get("start_utc"),

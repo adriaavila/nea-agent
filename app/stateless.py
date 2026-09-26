@@ -22,7 +22,7 @@ import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, SecretStr, field_validator
 
@@ -35,7 +35,7 @@ from app.multiorg import crm_for
 from app.profile import BusinessProfile, profile_from_payload
 from app.prompt import TEAM_OWNER_MARKER_PREFIX, TEAM_OWNER_NOTE, build_system_prompt
 from app.state import AppContext, Conversation, InboundMessage, OfferedSlot, TurnCommit
-from app.tools import TOOL_SCHEMAS, MemoryOfferBook, ToolRuntime
+from app.tools import TOOL_SCHEMAS, AlreadyBooked, MemoryOfferBook, ToolRuntime
 from app.turn import _agent_tz
 
 logger = logging.getLogger("nea.stateless")
@@ -72,7 +72,12 @@ class DispatchMediaIn(BaseModel):
     caption: str | None = None
     transcript: str | None = None
     location: dict[str, Any] | None = None
-    contacts: list[str] | None = None
+    # Objetos de contacto CRUDOS de Meta (name{formatted_name,first_name} o
+    # string; phones[].phone), tal cual los reenvía el CRM — NUNCA
+    # normalizados a `list[str]`: eso rechazaba con 400 TODO despacho que
+    # tuviera una tarjeta de contacto en el historial. Se renderizan con
+    # `_contact_summaries` (nombre + teléfono si hay).
+    contacts: list[Any] | None = None
 
 
 class DispatchHistoryItemIn(BaseModel):
@@ -91,7 +96,11 @@ class DispatchOfferIn(BaseModel):
 
 
 class DispatchLlmIn(BaseModel):
-    provider: str  # openrouter | openai
+    # Literal, no `str`: un valor mal escrito/capitalizado (p.ej. "OpenRouter")
+    # con `str` suelto pasaba silencioso y mandaba la clave de OpenRouter del
+    # negocio a api.openai.com (base_url=None por default) — 401 confuso en
+    # el proveedor EQUIVOCADO en vez de un 400 claro aquí.
+    provider: Literal["openrouter", "openai"]
     model: str
     apiKey: SecretStr
 
@@ -102,7 +111,10 @@ class DispatchPayloadV2(BaseModel):
     descarta solo (default `extra='ignore'`), nunca se declaran aquí."""
 
     version: int = 2
-    dispatchId: str | None = None
+    # Obligatorio (contrato v2): es la clave de idempotencia de cada envío
+    # (ver app/stateless._send) — sin él, un reintento del CRM no podría
+    # dedupear el mensaje real en /api/bot/messages.
+    dispatchId: str
     attempt: int = 0
     organizationId: str | None = None
     conversationId: str | None = None
@@ -123,23 +135,39 @@ class DispatchPayloadV2(BaseModel):
 
 @dataclass
 class V2Result:
-    """Lo que `app/dispatch.py` traduce al sobre de respuesta del contrato."""
+    """Lo que `app/dispatch.py` traduce al sobre de respuesta del contrato.
+
+    `llm_source` es de quién es la clave que el CRM debe evaluar para
+    invalidar: "org" siempre que se haya intentado usar la del negocio —
+    incluso si terminó respondiendo la plataforma tras un fallback. El CRM
+    solo marca una clave inválida cuando `source == "org"`, así que reportar
+    "platform" tras un fallback dejaría la clave rota del negocio viva para
+    siempre. `llm_answered_with` (extra, fuera del contrato mínimo) es quién
+    contestó DE VERDAD — solo informativo."""
 
     action: str  # replied | silent | noop | reset
     llm_source: str = "platform"
     llm_status: str = "ok"
+    llm_answered_with: str = "platform"
     handoff_reason: str | None = None
     handoff_applied: bool | None = None
 
 
 @dataclass
 class _LlmState:
-    """Qué cliente terminó respondiendo y con qué estado — sobrevive aunque
-    `_tool_loop` termine en `LlmExhausted` (la excepción no puede cargar esto
-    y el llamador necesita saberlo igual para el `llm` de la respuesta)."""
+    """Qué clave está bajo reporte y quién terminó respondiendo — sobrevive
+    aunque `_tool_loop` termine en `LlmExhausted` (la excepción no puede
+    cargar esto y el llamador necesita saberlo igual para el `llm` de la
+    respuesta).
+
+    `source` se fija UNA vez al arrancar el turno (según si había clave de
+    negocio) y NUNCA cambia — es "de quién es la clave en juego", no "quién
+    contestó" (ver `V2Result`). Solo `status` y `answered_with` cambian
+    durante `_tool_loop`."""
 
     source: str = "platform"
     status: str = "ok"
+    answered_with: str = "platform"
 
 
 # --------------------------------------------------------------- identidad ---
@@ -197,6 +225,45 @@ def _caption_suffix(media_: DispatchMediaIn | None) -> str:
     return ""
 
 
+def _contact_name(c: dict[str, Any]) -> str:
+    name = c.get("name")
+    if isinstance(name, str) and name.strip():
+        return name.strip()
+    if isinstance(name, dict):
+        found = name.get("formatted_name") or name.get("first_name")
+        if found:
+            return str(found)
+    return "Contacto"
+
+
+def _contact_phone(c: dict[str, Any]) -> str | None:
+    phones = c.get("phones")
+    if isinstance(phones, list) and phones and isinstance(phones[0], dict):
+        phone = phones[0].get("phone")
+        if phone:
+            return str(phone)
+    phone = c.get("phone")
+    return str(phone) if phone else None
+
+
+def _contact_summaries(contacts: Any) -> list[str]:
+    """`media.contacts` trae los objetos CRUDOS de Meta (name{formatted_name,
+    first_name} o string suelto; phones[].phone) — mismo shape que ingiere el
+    CRM (`src/server/inbox/ingest.ts`) sin normalizar. Nunca se declara
+    `list[str]` en el modelo (eso rechazaba con 400 cualquier despacho con
+    una tarjeta de contacto en el historial): se recorre tolerante aquí."""
+    if not isinstance(contacts, list):
+        return []
+    out: list[str] = []
+    for c in contacts:
+        if not isinstance(c, dict):
+            continue
+        name = _contact_name(c)
+        phone = _contact_phone(c)
+        out.append(f"{name} ({phone})" if phone else name)
+    return out
+
+
 def _settled_media_text(item: DispatchHistoryItemIn) -> str | None:
     """Media de un mensaje YA resuelto (no pendiente de esta ráfaga): solo
     texto, con lo que el CRM ya trae — nunca se vuelve a descargar nada."""
@@ -208,7 +275,7 @@ def _settled_media_text(item: DispatchHistoryItemIn) -> str | None:
     if item.type == "location":
         return _render_location_text(media_.location if media_ else None)
     if item.type == "contacts":
-        nombres = ", ".join((media_.contacts if media_ else None) or []) or "alguien"
+        nombres = ", ".join(_contact_summaries(media_.contacts if media_ else None)) or "alguien"
         return f"[Compartió una tarjeta de contacto de: {nombres}.]"
     etiquetas = {
         "image": "una imagen",
@@ -281,7 +348,10 @@ async def _describe_pending_item(
         media_caption=media_.caption if media_ else None,
         media_voice=(item.type == "audio"),
         location=media_.location if media_ else None,
-        contact_names=(media_.contacts if media_ else None) or [],
+        # app/media.py._contacts solo une `contact_names` tal cual (piensa
+        # que ya son nombres de texto) — se le pasan las tarjetas YA
+        # renderizadas ("Nombre (teléfono)"), no los objetos crudos.
+        contact_names=_contact_summaries(media_.contacts if media_ else None),
     )
     part = await media.describe_item(media_ctx, msg)
     return part.text, part.image_data_uri
@@ -347,6 +417,33 @@ def _history_messages(
     return out, had_team_or_owner
 
 
+def _strip_leaked_marker(text: str) -> str:
+    """El modelo VE el marcador de equipo/dueño en su propio historial (como
+    turno de "assistant") y a veces lo repite al generar su respuesta — eso
+    jamás debe llegarle al lead. Se quita solo si aparece al INICIO (con o
+    sin los dos puntos que sigue), nunca en medio del texto — ahí sería parte
+    legítima de la respuesta, no una fuga del marcador."""
+    stripped = text.lstrip()
+    if not stripped.startswith(TEAM_OWNER_MARKER_PREFIX):
+        return stripped
+    rest = stripped[len(TEAM_OWNER_MARKER_PREFIX):].lstrip()
+    if rest.startswith(":"):
+        rest = rest[1:].lstrip()
+    return rest
+
+
+def _burst_text(item: DispatchHistoryItemIn) -> str | None:
+    """El texto de UN mensaje del lead para el conteo de hostilidad: el texto
+    tal cual, o — para una nota de voz sin texto propio — su transcripción.
+    Sin este fallback, una hostilidad dicha por audio nunca contaba (AC-18
+    exige contar la hostilidad SOSTENIDA sin importar el canal)."""
+    if item.text:
+        return item.text
+    if item.type == "audio" and item.media and item.media.transcript:
+        return item.media.transcript
+    return None
+
+
 def _bursts(history: list[DispatchHistoryItemIn], pending_text: str) -> list[str]:
     """Agrupa mensajes CONSECUTIVOS del lead en una ráfaga — la hostilidad
     sostenida (AC-18) cuenta ráfagas, no mensajes sueltos. Cualquier mensaje
@@ -357,8 +454,9 @@ def _bursts(history: list[DispatchHistoryItemIn], pending_text: str) -> list[str
         if item.role == "lead" and item.pending:
             continue  # el pendiente se agrega aparte, al final
         if item.role == "lead":
-            if item.text:
-                current.append(item.text)
+            text = _burst_text(item)
+            if text:
+                current.append(text)
         elif current:
             bursts.append("\n".join(current))
             current = []
@@ -396,15 +494,41 @@ def _offers_from_payload(offers: list[DispatchOfferIn]) -> list[OfferedSlot]:
     return out
 
 
+def _already_booked_from_context(context: dict[str, Any]) -> AlreadyBooked | None:
+    """La cita YA agendada de este lead (`context.booking.next`, shape real:
+    `{id, scheduledAtUtc, label, meetingLink}` — ver
+    `server/agencia/bot-perfil.ts:proximaCita` del CRM). Sirve para que un
+    REINTENTO del despacho (create_booking 201 en el intento anterior, pero
+    la confirmación nunca salió) reconozca la reserva como propia en vez de
+    rechazarla por "no ofrecida" — ver `ToolRuntime.already_booked` en
+    app/tools.py."""
+    next_booking = ((context or {}).get("booking") or {}).get("next")
+    if not isinstance(next_booking, dict):
+        return None
+    start = _parse_utc(str(next_booking.get("scheduledAtUtc") or ""))
+    if start is None:
+        return None
+    return AlreadyBooked(
+        start_utc=start,
+        label=str(next_booking.get("label") or ""),
+        meeting_url=next_booking.get("meetingLink"),
+    )
+
+
 # ------------------------------------------------------------------- LLM ---
 
 
 def _build_org_llm(llm_in: DispatchLlmIn) -> OpenAiLlm:
     """Cliente del NEGOCIO, vivo solo durante este turno — `run_turn` lo
     cierra siempre en su `finally`. Nunca sirve para transcribir (eso es
-    SIEMPRE la plataforma, ver app/llm.py)."""
+    SIEMPRE la plataforma, ver app/llm.py). `max_retries=0`: es un cliente de
+    usar y cerrar dentro del presupuesto de 75 s del despacho — a diferencia
+    del cliente COMPARTIDO de plataforma (app/main.py, sin este parámetro,
+    con el default del SDK — v1/legacy no cambia de comportamiento)."""
     base_url = "https://openrouter.ai/api/v1" if llm_in.provider == "openrouter" else None
-    return OpenAiLlm(llm_in.apiKey.get_secret_value(), llm_in.model, base_url=base_url)
+    return OpenAiLlm(
+        llm_in.apiKey.get_secret_value(), llm_in.model, base_url=base_url, max_retries=0
+    )
 
 
 async def _tool_loop(
@@ -417,23 +541,42 @@ async def _tool_loop(
     """Rondas de tool-calling hasta obtener texto final (o rendirse) — igual
     que app/turn.py._tool_loop, más el fallback de clave por negocio: si el
     cliente del negocio falla por credenciales/crédito, esta MISMA llamada se
-    reintenta YA con la plataforma, y el resto del turno sigue con ella."""
+    reintenta YA con la plataforma, y el resto del turno sigue con ella
+    (`active` es local a este loop: las rondas siguientes ya no vuelven a
+    intentar la del negocio).
+
+    Nota: `state.source` NUNCA se toca aquí — se fija una sola vez al armar
+    `state` (ver `run_turn`) y representa de quién es la clave reportada, no
+    quién contestó (ver `V2Result`)."""
     active = org_llm or platform_llm
     for _ in range(MAX_TOOL_ROUNDS):
         try:
             reply = await active.complete(messages, tools=TOOL_SCHEMAS)
         except (LlmAuthFailed, LlmNoCredits) as exc:
+            status = "auth_failed" if isinstance(exc, LlmAuthFailed) else "no_credits"
             if active is platform_llm:
-                # la plataforma TAMBIÉN falló por credenciales — no hay a
-                # dónde más caer; se trata como agotado (silencio + handoff).
+                # La plataforma (sola — sin clave de negocio en este turno —
+                # o ya tras el fallback) TAMBIÉN falló por credenciales: no
+                # hay a dónde más caer. Se reporta igual (informativo: el CRM
+                # solo invalida con `source=="org"`, pero un incidente real
+                # de la clave de PLATAFORMA no debe leerse como "ok" en los
+                # logs) y nunca debe escapar como 500 — el CRM reintentaría
+                # el despacho ENTERO contra las MISMAS claves rotas, una
+                # tormenta de reintentos que no arregla nada. Se vuelve un
+                # agotamiento normal: silencio + handoff `error`, 200 con el
+                # `llm` ya reportado.
+                state.status = status
                 raise LlmExhausted(str(exc)) from exc
-            state.status = "auth_failed" if isinstance(exc, LlmAuthFailed) else "no_credits"
-            state.source = "platform"
+            state.status = status
+            state.answered_with = "platform"
             logger.warning(
                 "stateless: LLM del negocio falló (%s) — cae a la plataforma", exc
             )
             active = platform_llm
-            reply = await active.complete(messages, tools=TOOL_SCHEMAS)
+            try:
+                reply = await active.complete(messages, tools=TOOL_SCHEMAS)
+            except (LlmAuthFailed, LlmNoCredits) as exc2:
+                raise LlmExhausted(str(exc2)) from exc2
         if not reply.tool_calls:
             return reply.content
         messages.append(
@@ -599,12 +742,17 @@ async def run_turn(
         try:
             await scoped_crm.post_activate(conversation_id)
         except CrmError as exc:
+            # Se propaga (dispatch.py la vuelve 5xx, nada comprometido
+            # todavía) para que el CRM reintente — igual que v1 en modo
+            # estricto (app/turn.py: `if strict: raise`). v2 ES ese modo
+            # estricto siempre: degradar a silencio aquí dejaría el mensaje
+            # activador respondido con "nada" para siempre, sin reintento.
             logger.warning(
-                "stateless %s: no pude activar el chat (%s) — silencio",
+                "stateless %s: no pude activar el chat (%s) — 5xx para reintentar",
                 conversation_id,
                 exc,
             )
-            return V2Result(action="silent")
+            raise
         conv_info["aiEnabled"] = True
         logger.info("stateless %s: IA activada por mensaje configurado", conversation_id)
 
@@ -660,11 +808,25 @@ async def run_turn(
         conv=None,
         crm_conversation_id=conversation_id,
         profile=profile,
-        commit=commit,
+        # `commit=None`, NUNCA `commit=commit`: `_book_session` marca el
+        # commit ANTES de reservar (ver app/tools.py, necesario en v1 donde
+        # el envío no es idempotente). En v2 eso es un bug — un
+        # create_booking 201 seguido de un envío que agota sus reintentos
+        # marcaría "comprometido" sin que el lead haya recibido NADA, y
+        # dispatch.py respondería 200 (sin reintento posible: no hay
+        # pending_send en v2 que rescate ese mensaje). El ÚNICO commit válido
+        # en v2 es el de `_send`, tras su propio 2xx.
+        commit=None,
         offers=offer_book,
+        already_booked=_already_booked_from_context(context),
     )
     org_llm = _build_org_llm(payload.llm) if payload.llm is not None else None
-    state = _LlmState(source="org" if org_llm is not None else "platform")
+    # `source` se fija UNA vez aquí y no cambia — ver el docstring de
+    # `_LlmState`/`V2Result` (es de quién es la clave, no quién contestó).
+    state = _LlmState(
+        source="org" if org_llm is not None else "platform",
+        answered_with="org" if org_llm is not None else "platform",
+    )
     try:
         try:
             final_text = await _tool_loop(messages, runtime, org_llm, ctx.llm, state)
@@ -679,6 +841,7 @@ async def run_turn(
                 action="silent",
                 llm_source=state.source,
                 llm_status=state.status,
+                llm_answered_with=state.answered_with,
                 handoff_reason="error",
                 handoff_applied=applied,
             )
@@ -691,13 +854,18 @@ async def run_turn(
 
     sent = False
     if final_text and final_text.strip():
-        sent = await _send(
-            scoped_crm,
-            conversation_id,
-            final_text.strip(),
-            dispatch_id=payload.dispatchId,
-            commit=commit,
-        )
+        # El modelo ve el marcador de equipo/dueño en su propio historial y a
+        # veces lo repite — nunca debe llegarle al lead (ver
+        # `_strip_leaked_marker`).
+        texto = _strip_leaked_marker(final_text.strip())
+        if texto:
+            sent = await _send(
+                scoped_crm,
+                conversation_id,
+                texto,
+                dispatch_id=payload.dispatchId,
+                commit=commit,
+            )
 
     # El handoff se ejecuta DESPUÉS de la despedida (si no, el CRM la rechaza
     # con 409 ai_paused) — igual que en app/turn.py.
@@ -711,6 +879,7 @@ async def run_turn(
         action="replied" if sent else "silent",
         llm_source=state.source,
         llm_status=state.status,
+        llm_answered_with=state.answered_with,
         handoff_reason=handoff_reason,
         handoff_applied=handoff_applied,
     )

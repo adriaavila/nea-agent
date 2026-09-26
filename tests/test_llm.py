@@ -28,7 +28,7 @@ def _err(code: str | None = None, status: int = 400) -> httpx.Response:
 
 async def test_401_marca_auth_failed_sin_reintentar(respx_mock):
     route = respx_mock.post(OPENAI_CHAT).mock(return_value=_err(status=401))
-    llm = OpenAiLlm("sk-mala", "gpt-4o-mini")
+    llm = OpenAiLlm("sk-mala", "gpt-4o-mini", max_retries=0)
     with pytest.raises(LlmAuthFailed):
         await llm.complete(MSGS)
     assert route.call_count == 1  # sin reintentos: la MISMA clave no cambia
@@ -37,7 +37,9 @@ async def test_401_marca_auth_failed_sin_reintentar(respx_mock):
 
 async def test_402_marca_no_credits_sin_reintentar(respx_mock):
     route = respx_mock.post(OPENROUTER_CHAT).mock(return_value=_err(status=402))
-    llm = OpenAiLlm("sk-sin-credito", "z-ai/glm-5.3-flash", base_url="https://openrouter.ai/api/v1")
+    llm = OpenAiLlm(
+        "sk-sin-credito", "z-ai/glm-5.3-flash", base_url="https://openrouter.ai/api/v1", max_retries=0
+    )
     with pytest.raises(LlmNoCredits):
         await llm.complete(MSGS)
     assert route.call_count == 1
@@ -48,7 +50,7 @@ async def test_429_insufficient_quota_marca_no_credits(respx_mock):
     route = respx_mock.post(OPENAI_CHAT).mock(
         return_value=_err(code="insufficient_quota", status=429)
     )
-    llm = OpenAiLlm("sk-x", "gpt-4o-mini")
+    llm = OpenAiLlm("sk-x", "gpt-4o-mini", max_retries=0)
     with pytest.raises(LlmNoCredits):
         await llm.complete(MSGS)
     assert route.call_count == 1
@@ -57,7 +59,7 @@ async def test_429_insufficient_quota_marca_no_credits(respx_mock):
 
 async def test_429_sin_insufficient_quota_reintenta_como_error_normal(respx_mock):
     route = respx_mock.post(OPENAI_CHAT).mock(return_value=_err(code="rate_limit_exceeded", status=429))
-    llm = OpenAiLlm("sk-x", "gpt-4o-mini")
+    llm = OpenAiLlm("sk-x", "gpt-4o-mini", max_retries=0)
     with pytest.raises(LlmExhausted):
         await llm.complete(MSGS)
     assert route.call_count == llm.RETRIES + 1  # SÍ reintentó — no es un fallo de clave
@@ -73,7 +75,9 @@ async def test_403_moderacion_no_cae_reintenta_como_error_normal(respx_mock):
     termina en LlmExhausted (silencio + handoff error, igual que cualquier
     otro fallo del LLM)."""
     route = respx_mock.post(OPENROUTER_CHAT).mock(return_value=_err(status=403))
-    llm = OpenAiLlm("sk-x", "z-ai/glm-5.3-flash", base_url="https://openrouter.ai/api/v1")
+    llm = OpenAiLlm(
+        "sk-x", "z-ai/glm-5.3-flash", base_url="https://openrouter.ai/api/v1", max_retries=0
+    )
     with pytest.raises(LlmExhausted):
         await llm.complete(MSGS)
     assert route.call_count == llm.RETRIES + 1
@@ -82,10 +86,43 @@ async def test_403_moderacion_no_cae_reintenta_como_error_normal(respx_mock):
 
 async def test_5xx_no_cae_reintenta_como_error_normal(respx_mock):
     route = respx_mock.post(OPENAI_CHAT).mock(return_value=httpx.Response(500))
-    llm = OpenAiLlm("sk-x", "gpt-4o-mini")
+    llm = OpenAiLlm("sk-x", "gpt-4o-mini", max_retries=0)
     with pytest.raises(LlmExhausted):
         await llm.complete(MSGS)
     assert route.call_count == llm.RETRIES + 1
+    await llm.aclose()
+
+
+# --------------------------------------------------- alcance de max_retries ---
+
+
+async def test_max_retries_por_default_deja_el_default_del_sdk(respx_mock):
+    """El cliente COMPARTIDO de plataforma (app/main.py) NO pasa
+    `max_retries` — v1/legacy no debe cambiar de comportamiento con este PR.
+    El guardia de 75 s (asyncio.wait_for en app/dispatch.py) es lo que
+    protege a v2 si esto tarda de más, no este parámetro."""
+    llm = OpenAiLlm("sk-x", "gpt-4o-mini")  # sin max_retries: el de siempre
+    assert llm._client.max_retries == 2  # default del SDK, sin tocar
+    await llm.aclose()
+
+
+async def test_max_retries_cero_es_explicito_para_el_cliente_por_turno(respx_mock):
+    """app/stateless._build_org_llm SÍ lo pasa en 0 — un cliente de usar y
+    cerrar dentro del presupuesto de 75 s del despacho."""
+    llm = OpenAiLlm("sk-x", "z-ai/glm-5.3-flash", base_url="https://openrouter.ai/api/v1", max_retries=0)
+    assert llm._client.max_retries == 0
+    await llm.aclose()
+
+
+async def test_max_retries_cero_tambien_alcanza_al_cliente_de_whisper_aparte(respx_mock):
+    llm = OpenAiLlm(
+        "sk-openrouter",
+        "z-ai/glm-5.3-flash",
+        base_url="https://openrouter.ai/api/v1",
+        openai_api_key="sk-openai-real",
+        max_retries=0,
+    )
+    assert llm._whisper_client.max_retries == 0
     await llm.aclose()
 
 

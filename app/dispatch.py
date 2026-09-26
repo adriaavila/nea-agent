@@ -409,7 +409,16 @@ def _v2_body(result: "stateless.V2Result | None") -> dict[str, Any]:
     return {
         "ok": True,
         "action": result.action,
-        "llm": {"source": result.llm_source, "status": result.llm_status},
+        # `source` es del contrato: de quién es la clave que el CRM evalúa
+        # para invalidar (server/ai/pipeline.ts:applyNeaResponse — solo si
+        # source==="org"). `answeredWith` es un extra informativo (fuera del
+        # contrato mínimo, pero el CRM tolera campos de más — no hay
+        # validación estricta del body de Nea) con quién contestó de verdad.
+        "llm": {
+            "source": result.llm_source,
+            "status": result.llm_status,
+            "answeredWith": result.llm_answered_with,
+        },
         "handoff": (
             {"reason": result.handoff_reason, "applied": bool(result.handoff_applied)}
             if result.handoff_reason is not None
