@@ -302,6 +302,75 @@ async def test_arranque_persistente_dispatch_only_no_exige_meta_app_secret(monke
         pass  # no debe lanzar RuntimeError
 
 
+async def test_arranque_dispatch_only_sin_database_url_no_usa_postgres(monkeypatch):
+    """PR 2B: `DISPATCH_ONLY=true` SIN `DATABASE_URL` arranca igual — sin
+    PgStore, sin migraciones, sin workers de fondo y sin /webhook. Solo queda
+    /dispatch (v2 — v1 responde 503, ver test_dispatch_only_sin_db_v1_da_503)
+    y /health, que debe contestar sin tocar ninguna base."""
+    from app import main
+
+    monkeypatch.setattr(
+        main,
+        "Settings",
+        lambda: make_settings(
+            database_url="",
+            meta_app_secret="",
+            crm_bot_api_key="k",
+            dispatch_only=True,
+        ),
+    )
+
+    def _revienta(*_a, **_kw):
+        raise AssertionError("PgStore no debía construirse sin DATABASE_URL")
+
+    monkeypatch.setattr(main, "PgStore", _revienta)
+
+    app = main.create_app()
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://bot.test") as c:
+            resp = await c.get("/health")
+            assert resp.status_code == 200
+            assert resp.json() == {"status": "ok", "db": "none"}
+            # /webhook no se monta en este modo: 404, no 401 (ni verificado).
+            webhook_resp = await c.get(
+                "/webhook",
+                params={"hub.mode": "subscribe", "hub.verify_token": "x", "hub.challenge": "y"},
+            )
+            assert webhook_resp.status_code == 404
+
+
+async def test_dispatch_only_sin_db_v1_da_503(monkeypatch):
+    """El mismo arranque sin base: un despacho v1 (sin `version`, o `1`) no
+    tiene Store real que tocar — 503 claro, en vez de reventar contra una
+    base inexistente. v2 sigue funcionando (test_stateless.py lo cubre)."""
+    from app import main
+
+    monkeypatch.setattr(
+        main,
+        "Settings",
+        lambda: make_settings(
+            database_url="",
+            meta_app_secret="",
+            crm_bot_api_key="test-key",
+            dispatch_only=True,
+        ),
+    )
+    monkeypatch.setattr(
+        main, "PgStore", lambda *_a, **_kw: (_ for _ in ()).throw(AssertionError("sin DB"))
+    )
+
+    app = main.create_app()
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://bot.test") as c:
+            from tests.test_dispatch import dispatch_body, sign
+
+            body = dispatch_body(organization_id="org_a", conversation_id="cv_1")
+            resp = await c.post("/dispatch", content=body, headers={"x-signature": sign(body)})
+            assert resp.status_code == 503
+
+
 async def test_webhook_deshabilitado_en_despliegue_dispatch_only(ctx, client):
     """Con DISPATCH_ONLY=true y sin META_APP_SECRET, el webhook de Meta
     rechaza TODO en vez de aceptar payloads sin firma."""

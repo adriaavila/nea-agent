@@ -42,6 +42,17 @@ class AgendaUnavailable(CrmError):
     """Esta instancia del CRM no tiene agenda encendida (bandera AGENDA)."""
 
 
+class CrmPaymentRequired(CrmError):
+    """402 de /api/bot/messages (despacho v2): límite del plan del negocio.
+    A diferencia de un 409 (ai_paused/window_closed), esto no es un estado de
+    la conversación — es final igual: no se reintenta, no hay nada que un
+    reintento del turno pudiera arreglar."""
+
+    def __init__(self, code: str = "payment_required") -> None:
+        super().__init__(code)
+        self.code = code
+
+
 class SlotTaken(CrmConflict):
     """El slot se ocupó entre oferta y confirmación; trae alternativas frescas."""
 
@@ -159,18 +170,46 @@ class CrmClient:
         data: dict[str, Any] = resp.json()
         return data
 
-    async def send_message(self, conversation_id: str, text: str) -> dict[str, Any]:
-        resp = await self._request(
-            "POST",
-            "/api/bot/messages",
-            json={"conversationId": conversation_id, "text": text},
-        )
+    async def send_message(
+        self,
+        conversation_id: str,
+        text: str,
+        *,
+        dispatch_id: str | None = None,
+        seq: int | None = None,
+    ) -> dict[str, Any]:
+        """`dispatch_id`/`seq` (despacho v2, PR 2A): el CRM arma con ellos un
+        id de mensaje DETERMINISTA y reserva el envío antes de tocar Graph —
+        reintentar con el MISMO par es seguro, nunca duplica el mensaje real.
+        `None` (default, camino v1/legacy) no manda esos campos — cuerpo
+        idéntico al de siempre."""
+        body: dict[str, Any] = {"conversationId": conversation_id, "text": text}
+        if dispatch_id is not None:
+            body["dispatchId"] = dispatch_id
+        if seq is not None:
+            body["seq"] = seq
+        resp = await self._request("POST", "/api/bot/messages", json=body)
         if resp.status_code == 409:
             raise CrmConflict(_conflict_code(resp))
+        if resp.status_code == 402:
+            raise CrmPaymentRequired(_conflict_code(resp))
         if resp.status_code != 200:
             raise CrmError(f"messages devolvió {resp.status_code}")
         data: dict[str, Any] = resp.json()
         return data
+
+    async def post_transcript(self, message_id: str, text: str) -> None:
+        """Escribe de vuelta la transcripción de un audio (despacho v2, antes
+        de llamar al LLM): `POST /api/bot/messages/{messageId}/transcript`.
+        Gana la primera escritura del lado del CRM; aquí no hay reintentos —
+        el llamador (app/stateless.py) lo trata como best-effort."""
+        resp = await self._request(
+            "POST",
+            f"/api/bot/messages/{message_id}/transcript",
+            json={"text": text},
+        )
+        if resp.status_code != 200:
+            raise CrmError(f"transcript devolvió {resp.status_code}")
 
     async def put_ficha(
         self, conversation_id: str, ficha: dict[str, Any]
@@ -299,12 +338,26 @@ class CrmClient:
         if resp.status_code != 200:
             raise CrmError(f"typing devolvió {resp.status_code}")
 
-    async def post_reset(self, conversation_id: str) -> None:
+    async def post_reset(
+        self,
+        conversation_id: str,
+        *,
+        notice: str | None = None,
+        dispatch_id: str | None = None,
+    ) -> None:
         """Reinicio de pruebas (spec 002): ficha limpia + IA reactivada + etapa
-        al inicio en el CRM. Solo lo dispara el comando /reset de la allowlist."""
-        resp = await self._request(
-            "POST", "/api/bot/reset", json={"conversationId": conversation_id}
-        )
+        al inicio en el CRM. Solo lo dispara el comando /reset de la allowlist.
+
+        `notice`/`dispatch_id` (despacho v2): sin `bot_conversation` local que
+        reiniciar, Nea no tiene de dónde mandar el aviso ella misma — se lo
+        pasa al CRM para que LO envíe él. `None` (default, v1/legacy) deja el
+        cuerpo idéntico al de siempre."""
+        body: dict[str, Any] = {"conversationId": conversation_id}
+        if notice is not None:
+            body["notice"] = notice
+        if dispatch_id is not None:
+            body["dispatchId"] = dispatch_id
+        resp = await self._request("POST", "/api/bot/reset", json=body)
         if resp.status_code != 200:
             raise CrmError(f"reset devolvió {resp.status_code}")
 

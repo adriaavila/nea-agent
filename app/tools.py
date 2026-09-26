@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Protocol
 
 from app.crm import AgendaUnavailable, CrmError, SlotTaken
 from app.profile import BusinessProfile
@@ -18,6 +18,53 @@ from app.state import AppContext, Conversation, OfferedSlot, TurnCommit
 logger = logging.getLogger("nea.tools")
 
 MAX_OFFERED = 3
+
+
+class OfferBook(Protocol):
+    """Dónde vive "lo que ya se le ofreció a este lead" — el catálogo que
+    `book_session` valida por epoch exacto (ver `_book_session`). Dos
+    implementaciones: una respaldada por el Store (v1/legacy, la de
+    siempre) y una puramente en memoria (despacho v2, sembrada de
+    `payload.offers` — sin base de datos que tocar)."""
+
+    async def get(self) -> list[OfferedSlot]: ...
+    async def replace(self, slots: list[OfferedSlot]) -> None: ...
+    async def clear(self) -> None: ...
+
+
+class StoreOfferBook:
+    """Adaptador delgado sobre el Store — el camino de siempre (v1/legacy)."""
+
+    def __init__(self, store: Any, conversation_id: int) -> None:
+        self._store = store
+        self._conversation_id = conversation_id
+
+    async def get(self) -> list[OfferedSlot]:
+        return await self._store.get_offered_slots(self._conversation_id)
+
+    async def replace(self, slots: list[OfferedSlot]) -> None:
+        await self._store.replace_offered_slots(self._conversation_id, slots)
+
+    async def clear(self) -> None:
+        await self._store.clear_offered_slots(self._conversation_id)
+
+
+class MemoryOfferBook:
+    """Catálogo en memoria, vivo solo durante ESTE turno (despacho v2): se
+    siembra de `payload.offers` y `propose_slots` lo reemplaza — jamás toca
+    el Store (Nea no guarda nada en v2)."""
+
+    def __init__(self, initial: list[OfferedSlot] | None = None) -> None:
+        self._slots = list(initial or [])
+
+    async def get(self) -> list[OfferedSlot]:
+        return list(self._slots)
+
+    async def replace(self, slots: list[OfferedSlot]) -> None:
+        self._slots = list(slots)
+
+    async def clear(self) -> None:
+        self._slots = []
 
 TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
@@ -185,16 +232,25 @@ class ToolRuntime:
     def __init__(
         self,
         ctx: AppContext,
-        conv: Conversation,
+        conv: Conversation | None,
         crm_conversation_id: str,
         profile: BusinessProfile | None = None,
         commit: TurnCommit | None = None,
+        offers: OfferBook | None = None,
     ) -> None:
         self._ctx = ctx
         self._conv = conv
         self._crm_conv_id = crm_conversation_id
         self._profile = profile or BusinessProfile()
         self._commit = commit
+        # v1/legacy (offers=None, comportamiento de SIEMPRE): respaldado por
+        # el Store, requiere un `conv` real. v2 (despacho sin estado) siempre
+        # pasa su propio MemoryOfferBook — `conv` puede venir None.
+        conv_id = conv.id if conv is not None else 0
+        self._offers: OfferBook = offers or StoreOfferBook(ctx.store, conv_id)
+        # Solo para ESTAMPAR OfferedSlot.conversation_id (metadato informativo
+        # de _slots_from_payload; las búsquedas reales van por self._offers).
+        self._conv_id_for_slots = conv_id
         # Efectos observables por turn.py:
         self.handoff_reason: str | None = None  # se ejecuta DESPUÉS de la despedida
         self.booked = False
@@ -244,14 +300,14 @@ class ToolRuntime:
                 "error": "sin_agenda",
                 "detalle": "esta instancia no agenda; usa handoff para coordinar directo",
             }
-        slots = _slots_from_payload(self._conv.id, payload["slots"])
+        slots = _slots_from_payload(self._conv_id_for_slots, payload["slots"])
         if not slots:
             return {
                 "ok": False,
                 "error": "sin_disponibilidad",
                 "detalle": "no hay horarios abiertos; ofrece handoff para coordinar directo",
             }
-        await self._ctx.store.replace_offered_slots(self._conv.id, slots)
+        await self._offers.replace(slots)
         self.proposed = True
         return {
             "ok": True,
@@ -277,7 +333,7 @@ class ToolRuntime:
         los mismos 409. Duplicarlo sería duplicar también los errores.
         """
         wanted = _parse_utc(str(args.get("start_utc") or ""))
-        offered = await self._ctx.store.get_offered_slots(self._conv.id)
+        offered = await self._offers.get()
         if wanted is None:
             return {
                 "ok": False,
@@ -326,8 +382,8 @@ class ToolRuntime:
             # Se ocupó entre oferta y elección, o el CRM no reconoce el
             # instante como ofrecido. Misma salida: alternativas frescas del
             # propio CRM, nunca discutir con el lead.
-            fresh = _slots_from_payload(self._conv.id, exc.slots)
-            await self._ctx.store.replace_offered_slots(self._conv.id, fresh)
+            fresh = _slots_from_payload(self._conv_id_for_slots, exc.slots)
+            await self._offers.replace(fresh)
             return {
                 "ok": False,
                 "error": exc.code,
@@ -338,7 +394,7 @@ class ToolRuntime:
                 ),
                 "slots": _slots_for_llm(fresh),
             }
-        await self._ctx.store.clear_offered_slots(self._conv.id)
+        await self._offers.clear()
         self.booked = True
         if not mover:
             try:
