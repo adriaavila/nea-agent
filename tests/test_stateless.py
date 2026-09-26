@@ -26,6 +26,7 @@ from tests.conftest import CRM_URL, IDENTITY, FakeLLM, make_ctx, mock_crm_basics
 
 SECRET = "test-key"  # CRM_BOT_API_KEY por defecto en tests.conftest.make_settings
 SLOT_ISO = "2026-07-20T16:00:00Z"
+SLOT2_ISO = "2026-07-21T16:00:00Z"
 
 
 def sign(body: bytes, secret: str = SECRET) -> str:
@@ -384,6 +385,76 @@ async def test_v2_marcador_en_medio_del_texto_no_se_toca(respx_mock):
     assert stateless._strip_leaked_marker(texto) == texto
 
 
+async def test_strip_leaked_marker_variantes_negrita_comillas_minusculas():
+    """Revisión ronda 3: el modelo no siempre repite el marcador literal —
+    lo "decora" con markdown o comillas, o lo escribe en minúsculas."""
+    casos = [
+        ("**[Respuesta de una persona del negocio]**: Claro.", "Claro."),
+        ('"[Respuesta de una persona del negocio]": Claro.', "Claro."),
+        ("[respuesta de una persona del negocio]: claro.", "claro."),
+        ("__[Respuesta de una persona del negocio]__: hola", "hola"),
+        ("'[Respuesta de una persona del negocio]': hola", "hola"),
+        ("[Respuesta de una persona del negocio] sin dos puntos.", "sin dos puntos."),
+    ]
+    for original, esperado in casos:
+        assert stateless._strip_leaked_marker(original) == esperado
+
+
+async def test_strip_leaked_marker_texto_normal_con_comillas_no_se_toca():
+    """Una comilla al inicio por razones legítimas (el lead citó algo) no
+    debe confundirse con el marcador envuelto en comillas."""
+    texto = '"Necesito ayuda" me dijiste, y por eso te escribo.'
+    assert stateless._strip_leaked_marker(texto) == texto
+
+
+async def test_v2_respuesta_que_es_solo_el_marcador_se_trata_como_agotado(respx_mock):
+    """Revisión ronda 3: si tras quitar el marcador no queda NADA, no debe
+    volverse un 200 silencioso sin que nadie se entere — se trata como el
+    mismo fallo que un LLM agotado: silencio + handoff `error`."""
+    ctx = make_ctx()
+    ctx.llm.replies = [LlmReply(content="[Respuesta de una persona del negocio]:   ")]
+    routes = mock_crm_basics(respx_mock, conv_id="cv_v2_marker_vacio")
+    payload = v2_payload(
+        conversation_id="cv_v2_marker_vacio",
+        history=[
+            hist("lead", "hola", pending=False),
+            hist("team", "ya te contesto", id="t1"),
+            hist("lead", "gracias", id="m2", pending=True),
+        ],
+    )
+    result = await stateless.run_turn(ctx, payload, organization_id="org_a")
+    assert result.action == "silent"
+    assert result.handoff_reason == "error"
+    assert routes["messages"].call_count == 0  # nunca se mandó un texto vacío
+    assert routes["handoff"].call_count == 1
+
+
+async def test_v2_marcador_vacio_respeta_un_handoff_ya_decidido(respx_mock):
+    """Si el modelo YA había pedido handoff (p.ej. el backstop de
+    hostilidad) y ADEMÁS su texto se queda vacío tras limpiar el marcador,
+    se respeta ESE motivo — no se pisa con "error"."""
+    ctx = make_ctx()
+    ctx.llm.replies = [
+        LlmReply(content="[Respuesta de una persona del negocio]:"),
+    ]
+    routes = mock_crm_basics(respx_mock, conv_id="cv_v2_marker_vacio_hostil")
+    payload = v2_payload(
+        conversation_id="cv_v2_marker_vacio_hostil",
+        history=[
+            hist("lead", "eres un estafador", pending=False),
+            hist("agent", "lamento que sientas eso", id="a1"),
+            hist("lead", "puros mentirosos, pura basura", id="m2", pending=False),
+            hist("agent", "entiendo tu molestia", id="a2"),
+            hist("lead", "pinches bots chafas", id="m3", pending=True),
+        ],
+    )
+    result = await stateless.run_turn(ctx, payload, organization_id="org_a")
+    assert result.action == "silent"
+    assert result.handoff_reason == "hostilidad"
+    body = json.loads(routes["handoff"].calls[0].request.content)
+    assert body["reason"] == "hostilidad"
+
+
 async def test_v2_hostilidad_cuenta_rafagas_no_mensajes(respx_mock):
     """Tres RÁFAGAS hostiles seguidas (separadas por respuestas del agente)
     disparan el backstop de handoff — igual que en v1."""
@@ -533,6 +604,44 @@ async def test_v2_ventana_cerrada_silencio(respx_mock):
     payload = v2_payload(window_open=False)
     result = await stateless.run_turn(ctx, payload, organization_id="org_a")
     assert result.action == "silent"
+
+
+def test_already_booked_from_context_sin_link_pending_default_false():
+    """Shape REAL de hoy (server/agencia/bot-perfil.ts:proximaCita): sin
+    `linkPending` en `booking.next` — se queda en False, el default de
+    siempre."""
+    context = {
+        "booking": {
+            "next": {
+                "id": "bk_1",
+                "scheduledAtUtc": SLOT_ISO,
+                "label": "lunes 10am",
+                "meetingLink": "https://zoom.us/j/1",
+            }
+        }
+    }
+    already = stateless._already_booked_from_context(context)
+    assert already is not None
+    assert already.link_pending is False
+
+
+def test_already_booked_from_context_con_link_pending_si_el_crm_lo_manda():
+    """Si el CRM llegara a agregar `linkPending` a `booking.next`, se lee —
+    no hay que tocar código para que empiece a reflejarse."""
+    context = {
+        "booking": {
+            "next": {
+                "id": "bk_1",
+                "scheduledAtUtc": SLOT_ISO,
+                "label": "lunes 10am",
+                "meetingLink": None,
+                "linkPending": True,
+            }
+        }
+    }
+    already = stateless._already_booked_from_context(context)
+    assert already is not None
+    assert already.link_pending is True
 
 
 async def test_v2_reset_llama_al_endpoint_v2_con_notice_y_dispatchid(respx_mock):
@@ -1000,6 +1109,43 @@ async def test_v2_booking_confirmado_en_reintento_no_reserva_dos_veces(respx_moc
     assert bookings_route.call_count == 0  # NUNCA se reservó de nuevo
 
 
+async def test_v2_reschedule_ida_y_vuelta_en_el_mismo_turno_nunca_da_un_ok_falso(respx_mock):
+    """Ronda 3 de la revisión: `_already_booked` se quedaba con el snapshot
+    de arranque durante TODO el turno. Reagendar T1→T2 (real) y luego, en la
+    MISMA ráfaga, T2→T1 comparaba T1 contra el T1 viejo del snapshot y
+    confirmaba sin tocar el CRM — con la etiqueta VIEJA. De punta a punta vía
+    run_turn: la segunda movida debe ser un PATCH real o un rechazo, nunca un
+    "ok" fabricado."""
+    ctx = make_ctx()
+    ctx.llm.replies = [
+        LlmReply(
+            content=None,
+            tool_calls=[ToolCall(id="t1", name="reschedule_session", arguments={"start_utc": SLOT2_ISO})],
+        ),
+        LlmReply(
+            content=None,
+            tool_calls=[ToolCall(id="t2", name="reschedule_session", arguments={"start_utc": SLOT_ISO})],
+        ),
+        LlmReply(content="Listo, confirmado."),
+    ]
+    mock_crm_basics(respx_mock, conv_id="cv_v2_reschedule_rt")
+    reschedule_route = respx_mock.patch(f"{CRM_URL}/api/bot/bookings").mock(
+        return_value=httpx.Response(200, json={"label": "martes 10am"})
+    )
+    payload = v2_payload(
+        conversation_id="cv_v2_reschedule_rt",
+        offers=[{"startUtc": SLOT2_ISO, "label": "martes 10am"}],
+    )
+    payload.context["booking"] = {
+        "next": {"id": "bk_1", "scheduledAtUtc": SLOT_ISO, "label": "lunes 10am", "meetingLink": None}
+    }
+    result = await stateless.run_turn(ctx, payload, organization_id="org_a")
+    assert result.action == "replied"
+    # La primera movida (T1->T2) fue el único PATCH real; la segunda
+    # (T2->T1, sin T1 ofrecido de nuevo) se rechazó — nunca un "ok" gratis.
+    assert reschedule_route.call_count == 1
+
+
 # ----------------------------------------------------------- org LLM ---
 
 
@@ -1042,6 +1188,28 @@ async def test_v2_llm_del_negocio_ok_source_es_org(respx_mock):
     assert result.llm_source == "org"
     assert result.llm_status == "ok"
     assert result.llm_answered_with == "org"
+
+
+async def test_v2_llm_del_negocio_403_limite_de_clave_cae_a_la_plataforma(respx_mock):
+    """Integración de la ronda 3: el 403 de OpenRouter por límite de GASTO de
+    la clave (sin código aparte, a diferencia de insufficient_quota) debe
+    caer a la plataforma igual que un 401/402 — mismo mecanismo de
+    _tool_loop, ahora con el disparador nuevo."""
+    ctx = make_ctx()
+    mock_crm_basics(respx_mock, conv_id="cv_v2_llm_403limit")
+    respx_mock.post("https://openrouter.ai/api/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            403, json={"error": {"message": "Key limit exceeded", "code": None}}
+        )
+    )
+    payload = v2_payload(
+        llm={"provider": "openrouter", "model": "z-ai/glm-5.3-flash", "apiKey": "sk-negocio-sin-presupuesto"}
+    )
+    result = await stateless.run_turn(ctx, payload, organization_id="org_a")
+    assert result.action == "replied"
+    assert result.llm_source == "org"
+    assert result.llm_status == "no_credits"
+    assert result.llm_answered_with == "platform"
 
 
 async def test_v2_sin_llm_del_negocio_usa_la_plataforma_directo(respx_mock):

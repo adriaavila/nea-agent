@@ -18,8 +18,8 @@ OPENROUTER_CHAT = "https://openrouter.ai/api/v1/chat/completions"
 MSGS = [{"role": "user", "content": "hola"}]
 
 
-def _err(code: str | None = None, status: int = 400) -> httpx.Response:
-    body = {"error": {"message": "boom", "type": "error", "param": None, "code": code}}
+def _err(code: str | None = None, status: int = 400, message: str = "boom") -> httpx.Response:
+    body = {"error": {"message": message, "type": "error", "param": None, "code": code}}
     return httpx.Response(status, json=body)
 
 
@@ -75,6 +75,52 @@ async def test_403_moderacion_no_cae_reintenta_como_error_normal(respx_mock):
     termina en LlmExhausted (silencio + handoff error, igual que cualquier
     otro fallo del LLM)."""
     route = respx_mock.post(OPENROUTER_CHAT).mock(return_value=_err(status=403))
+    llm = OpenAiLlm(
+        "sk-x", "z-ai/glm-5.3-flash", base_url="https://openrouter.ai/api/v1", max_retries=0
+    )
+    with pytest.raises(LlmExhausted):
+        await llm.complete(MSGS)
+    assert route.call_count == llm.RETRIES + 1
+    await llm.aclose()
+
+
+async def test_403_limite_de_gasto_de_la_clave_marca_no_credits_sin_reintentar(respx_mock):
+    """Revisión ronda 3: OpenRouter no tiene un código de error aparte para
+    "esta clave puntual se quedó sin presupuesto" (a diferencia del
+    `insufficient_quota` de OpenAI) — lo dice en el MENSAJE del 403
+    ("Key limit exceeded"). Debe caer a la plataforma igual que un 402."""
+    route = respx_mock.post(OPENROUTER_CHAT).mock(
+        return_value=_err(status=403, message="Key limit exceeded")
+    )
+    llm = OpenAiLlm(
+        "sk-x", "z-ai/glm-5.3-flash", base_url="https://openrouter.ai/api/v1", max_retries=0
+    )
+    with pytest.raises(LlmNoCredits):
+        await llm.complete(MSGS)
+    assert route.call_count == 1  # sin reintentos: la MISMA clave no cambia
+    await llm.aclose()
+
+
+async def test_403_menciona_credito_tambien_marca_no_credits(respx_mock):
+    route = respx_mock.post(OPENROUTER_CHAT).mock(
+        return_value=_err(status=403, message="Insufficient credit balance for this key")
+    )
+    llm = OpenAiLlm(
+        "sk-x", "z-ai/glm-5.3-flash", base_url="https://openrouter.ai/api/v1", max_retries=0
+    )
+    with pytest.raises(LlmNoCredits):
+        await llm.complete(MSGS)
+    assert route.call_count == 1
+    await llm.aclose()
+
+
+async def test_403_moderacion_de_verdad_no_menciona_limite_ni_credito_sigue_normal(respx_mock):
+    """Contraprueba: un 403 cuyo mensaje de verdad es moderación (nada de
+    "limit"/"credit") sigue el camino normal — reintenta, nunca marca ni cae
+    a la plataforma."""
+    route = respx_mock.post(OPENROUTER_CHAT).mock(
+        return_value=_err(status=403, message="Content flagged by moderation")
+    )
     llm = OpenAiLlm(
         "sk-x", "z-ai/glm-5.3-flash", base_url="https://openrouter.ai/api/v1", max_retries=0
     )

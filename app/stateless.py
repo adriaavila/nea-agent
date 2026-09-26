@@ -20,6 +20,7 @@ import asyncio
 import dataclasses
 import json
 import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Literal
@@ -417,19 +418,26 @@ def _history_messages(
     return out, had_team_or_owner
 
 
+# Envoltura tolerada alrededor del marcador filtrado: negritas/cursivas de
+# markdown (`*`, `_`) y comillas (rectas o tipográficas) — el modelo a veces
+# "decora" lo que ve en su propio historial en vez de repetirlo literal.
+_MARKER_DECOR = r'[\s"\'“”‘’*_]*'
+_MARKER_WORDS = r"respuesta\s+de\s+una\s+persona\s+del\s+negocio"
+# Solo al INICIO del texto (^): en medio sería parte legítima de la
+# respuesta (p.ej. el lead preguntó por esa frase), no una fuga del
+# marcador. `re.IGNORECASE` cubre la variante en minúsculas.
+_LEAKED_MARKER_RE = re.compile(
+    rf"^{_MARKER_DECOR}\[{_MARKER_DECOR}{_MARKER_WORDS}{_MARKER_DECOR}\]{_MARKER_DECOR}:?{_MARKER_DECOR}",
+    re.IGNORECASE,
+)
+
+
 def _strip_leaked_marker(text: str) -> str:
     """El modelo VE el marcador de equipo/dueño en su propio historial (como
-    turno de "assistant") y a veces lo repite al generar su respuesta — eso
-    jamás debe llegarle al lead. Se quita solo si aparece al INICIO (con o
-    sin los dos puntos que sigue), nunca en medio del texto — ahí sería parte
-    legítima de la respuesta, no una fuga del marcador."""
-    stripped = text.lstrip()
-    if not stripped.startswith(TEAM_OWNER_MARKER_PREFIX):
-        return stripped
-    rest = stripped[len(TEAM_OWNER_MARKER_PREFIX):].lstrip()
-    if rest.startswith(":"):
-        rest = rest[1:].lstrip()
-    return rest
+    turno de "assistant") y a veces lo repite al generar su respuesta —
+    literal, en negritas, entre comillas o en minúsculas — eso jamás debe
+    llegarle al lead."""
+    return _LEAKED_MARKER_RE.sub("", text.lstrip(), count=1)
 
 
 def _burst_text(item: DispatchHistoryItemIn) -> str | None:
@@ -495,11 +503,12 @@ def _offers_from_payload(offers: list[DispatchOfferIn]) -> list[OfferedSlot]:
 
 
 def _already_booked_from_context(context: dict[str, Any]) -> AlreadyBooked | None:
-    """La cita YA agendada de este lead (`context.booking.next`, shape real:
-    `{id, scheduledAtUtc, label, meetingLink}` — ver
-    `server/agencia/bot-perfil.ts:proximaCita` del CRM). Sirve para que un
-    REINTENTO del despacho (create_booking 201 en el intento anterior, pero
-    la confirmación nunca salió) reconozca la reserva como propia en vez de
+    """La cita YA agendada de este lead (`context.booking.next`, shape real
+    HOY: `{id, scheduledAtUtc, label, meetingLink}` — ver
+    `server/agencia/bot-perfil.ts:proximaCita` del CRM; ese shape NO incluye
+    `linkPending` todavía). Sirve para que un REINTENTO del despacho
+    (create_booking/reschedule_booking 2xx en el intento anterior, pero la
+    confirmación nunca salió) reconozca la reserva como propia en vez de
     rechazarla por "no ofrecida" — ver `ToolRuntime.already_booked` en
     app/tools.py."""
     next_booking = ((context or {}).get("booking") or {}).get("next")
@@ -512,6 +521,10 @@ def _already_booked_from_context(context: dict[str, Any]) -> AlreadyBooked | Non
         start_utc=start,
         label=str(next_booking.get("label") or ""),
         meeting_url=next_booking.get("meetingLink"),
+        # El CRM no manda esto hoy (proximaCita no lo incluye) — se lee de
+        # todas formas, por si lo agrega: sin el campo, esto es simplemente
+        # `bool(None)` = False, el mismo default que había antes.
+        link_pending=bool(next_booking.get("linkPending")),
     )
 
 
@@ -858,14 +871,35 @@ async def run_turn(
         # veces lo repite — nunca debe llegarle al lead (ver
         # `_strip_leaked_marker`).
         texto = _strip_leaked_marker(final_text.strip())
-        if texto:
-            sent = await _send(
-                scoped_crm,
+        if not texto:
+            # El modelo solo repitió el marcador (o una variante) y no dijo
+            # NADA más — un 200 silencioso aquí sería peor que agotado: nadie
+            # se entera de que la conversación se quedó sin respuesta. Se
+            # trata como el mismo fallo que un LLM agotado (silencio +
+            # handoff), respetando un handoff que el modelo YA hubiera
+            # decidido en esta misma ronda (p.ej. el backstop de hostilidad).
+            logger.error(
+                "stateless %s: la respuesta del modelo quedó vacía tras "
+                "quitar el marcador filtrado — se trata como agotado",
                 conversation_id,
-                texto,
-                dispatch_id=payload.dispatchId,
-                commit=commit,
             )
+            reason = runtime.handoff_reason or "error"
+            applied = await _safe_handoff(scoped_crm, conversation_id, reason)
+            return V2Result(
+                action="silent",
+                llm_source=state.source,
+                llm_status=state.status,
+                llm_answered_with=state.answered_with,
+                handoff_reason=canonical_handoff_reason(reason),
+                handoff_applied=applied,
+            )
+        sent = await _send(
+            scoped_crm,
+            conversation_id,
+            texto,
+            dispatch_id=payload.dispatchId,
+            commit=commit,
+        )
 
     # El handoff se ejecuta DESPUÉS de la despedida (si no, el CRM la rechaza
     # con 409 ai_paused) — igual que en app/turn.py.

@@ -13,6 +13,8 @@ from tests.conftest import CRM_CONV_ID, CRM_URL, IDENTITY, make_ctx
 
 SLOT_ISO = "2026-07-20T16:00:00Z"
 SLOT_DT = datetime(2026, 7, 20, 16, 0, tzinfo=timezone.utc)
+SLOT2_ISO = "2026-07-21T16:00:00Z"
+SLOT2_DT = datetime(2026, 7, 21, 16, 0, tzinfo=timezone.utc)
 
 
 @pytest.fixture
@@ -183,7 +185,30 @@ async def test_book_session_sobre_lo_ya_agendado_es_idempotente_sin_tocar_el_crm
     assert result["ok"] is True
     assert result["label"] == "lunes 20 de julio, 10:00 am"
     assert result["meeting_url"] == "https://zoom.us/j/1"
+    assert result["link_pendiente"] is False  # default: el CRM no manda linkPending en booking.next hoy
     assert runtime.booked is True
+    await ctx.crm.aclose()
+
+
+async def test_book_session_idempotente_propaga_link_pending_si_viene(runtime_y_ctx):
+    """Ronda 3: si `context.booking.next` SÍ trae `linkPending` (el CRM no lo
+    manda hoy, pero por si lo agrega — ver AlreadyBooked), el atajo
+    idempotente debe reflejarlo, no un `False` fijo."""
+    from app.tools import AlreadyBooked
+
+    ctx = make_ctx()
+    conv = await ctx.store.get_or_create_conversation(IDENTITY)
+    runtime = ToolRuntime(
+        ctx,
+        conv,
+        CRM_CONV_ID,
+        already_booked=AlreadyBooked(
+            start_utc=SLOT_DT, label="lunes 10am", meeting_url=None, link_pending=True
+        ),
+    )
+    result = await runtime.execute("book_session", {"start_utc": SLOT_ISO})
+    assert result["ok"] is True
+    assert result["link_pendiente"] is True
     await ctx.crm.aclose()
 
 
@@ -242,3 +267,123 @@ async def test_v1_sin_already_booked_se_comporta_igual_que_siempre(runtime_y_ctx
     )
     assert result["ok"] is False
     assert result["error"] == "slot_no_ofrecido"
+
+
+# --------------------------------- regresión: already_booked queda viejo ---
+# Revisión de PR 2B, ronda 3: sin refrescar `_already_booked` tras una
+# reserva/movida REAL de este turno, un reschedule T1→T2 (real, exitoso)
+# seguido de otro T2→T1 en el MISMO turno comparaba T1 contra el snapshot
+# VIEJO (seguía en T1 desde el arranque) y devolvía "ok, movida a T1" SIN
+# tocar el CRM — el lead se enteraba de la hora equivocada.
+
+
+async def test_reschedule_a_otro_horario_y_de_vuelta_nunca_da_un_ok_falso(respx_mock):
+    from app.tools import AlreadyBooked
+
+    ctx = make_ctx()
+    conv = await ctx.store.get_or_create_conversation(IDENTITY)
+    # Arranca YA agendado en SLOT (snapshot de context.booking.next).
+    runtime = ToolRuntime(
+        ctx,
+        conv,
+        CRM_CONV_ID,
+        already_booked=AlreadyBooked(start_utc=SLOT_DT, label="lunes 10am", meeting_url=None),
+    )
+    reschedule_route = respx_mock.patch(f"{CRM_URL}/api/bot/bookings").mock(
+        return_value=httpx.Response(200, json={"label": "martes 10am", "meetingLink": None})
+    )
+    # El modelo mueve la cita a SLOT2 — real, ofrecido, debe pasar por el CRM.
+    await ctx.store.replace_offered_slots(
+        conv.id,
+        [OfferedSlot(conversation_id=conv.id, start_utc=SLOT2_DT, end_utc=None, label="martes 10am")],
+    )
+    result1 = await runtime.execute("reschedule_session", {"start_utc": SLOT2_ISO})
+    assert result1["ok"] is True
+    assert reschedule_route.call_count == 1
+
+    # El modelo (confundido, o el lead cambió de opinión) pide volver a SLOT
+    # (el horario ORIGINAL) EN EL MISMO turno. SLOT ya no está ofrecido (se
+    # limpió tras el éxito de arriba) y el snapshot de "ya agendado" ahora
+    # es SLOT2 (recién actualizado) — SLOT no debe dar un "ok" gratis.
+    result2 = await runtime.execute("reschedule_session", {"start_utc": SLOT_ISO})
+    assert result2["ok"] is False
+    assert result2["error"] == "slot_no_ofrecido"
+    assert reschedule_route.call_count == 1  # NO se llamó al CRM una segunda vez para esto
+
+    await ctx.crm.aclose()
+
+
+async def test_reschedule_de_vuelta_al_horario_original_si_se_reofrece_es_un_patch_real(
+    respx_mock,
+):
+    """La otra rama del mismo escenario: si SLOT (el original) se vuelve a
+    ofrecer de verdad tras la primera movida, el segundo reschedule_session
+    SÍ debe pasar por el CRM — nunca el atajo, porque ya no es el snapshot
+    de arranque."""
+    from app.tools import AlreadyBooked
+
+    ctx = make_ctx()
+    conv = await ctx.store.get_or_create_conversation(IDENTITY)
+    runtime = ToolRuntime(
+        ctx,
+        conv,
+        CRM_CONV_ID,
+        already_booked=AlreadyBooked(start_utc=SLOT_DT, label="lunes 10am", meeting_url=None),
+    )
+    reschedule_route = respx_mock.patch(f"{CRM_URL}/api/bot/bookings").mock(
+        side_effect=[
+            httpx.Response(200, json={"label": "martes 10am", "meetingLink": None}),
+            httpx.Response(200, json={"label": "lunes 10am de nuevo", "meetingLink": None}),
+        ]
+    )
+    await ctx.store.replace_offered_slots(
+        conv.id,
+        [OfferedSlot(conversation_id=conv.id, start_utc=SLOT2_DT, end_utc=None, label="martes 10am")],
+    )
+    result1 = await runtime.execute("reschedule_session", {"start_utc": SLOT2_ISO})
+    assert result1["ok"] is True
+
+    # SLOT se re-ofrece de verdad (p.ej. el lead pidió volver y el modelo
+    # llamó propose_slots otra vez).
+    await ctx.store.replace_offered_slots(
+        conv.id,
+        [OfferedSlot(conversation_id=conv.id, start_utc=SLOT_DT, end_utc=None, label="lunes 10am")],
+    )
+    result2 = await runtime.execute("reschedule_session", {"start_utc": SLOT_ISO})
+    assert result2["ok"] is True
+    assert result2["label"] == "lunes 10am de nuevo"
+    assert reschedule_route.call_count == 2  # las DOS movidas pasaron por el CRM
+
+    await ctx.crm.aclose()
+
+
+async def test_segunda_tool_call_sobre_lo_recien_reservado_en_el_mismo_turno_no_usa_el_atajo(
+    respx_mock,
+):
+    """Sin `already_booked` de arranque (una reserva NUEVA, no un reintento):
+    reservar y luego, en el MISMO turno, pedir el mismo horario otra vez no
+    debe dar un "ok" gratis — el catálogo ya lo limpió, así que cae a
+    "no ofrecido", no a un atajo de reintento que nunca aplicó aquí."""
+    ctx = make_ctx()
+    conv = await ctx.store.get_or_create_conversation(IDENTITY)
+    runtime = ToolRuntime(ctx, conv, CRM_CONV_ID)  # sin already_booked
+    booking_route = respx_mock.post(f"{CRM_URL}/api/bot/bookings").mock(
+        return_value=httpx.Response(201, json={"label": "lunes 10am", "meetingLink": None})
+    )
+    respx_mock.put(f"{CRM_URL}/api/bot/ficha").mock(
+        return_value=httpx.Response(200, json={"ficha": {}, "stageMoved": True})
+    )
+    await ctx.store.replace_offered_slots(
+        conv.id,
+        [OfferedSlot(conversation_id=conv.id, start_utc=SLOT_DT, end_utc=None, label="lunes 10am")],
+    )
+    result1 = await runtime.execute("book_session", {"start_utc": SLOT_ISO})
+    assert result1["ok"] is True
+    assert booking_route.call_count == 1
+
+    result2 = await runtime.execute("book_session", {"start_utc": SLOT_ISO})
+    assert result2["ok"] is False
+    assert result2["error"] == "slot_no_ofrecido"
+    assert booking_route.call_count == 1  # nunca una segunda reserva
+
+    await ctx.crm.aclose()

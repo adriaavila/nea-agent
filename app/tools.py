@@ -71,9 +71,12 @@ class MemoryOfferBook:
 @dataclass
 class AlreadyBooked:
     """La cita YA agendada de este lead, tal como la trae `context.booking.next`
-    del despacho v2 (`{scheduledAtUtc, label, meetingLink}`). Existe para un
-    caso puntual pero real: `create_booking` respondió 201 pero el envío de
-    la confirmación agotó sus reintentos (v2 no tiene `pending_send` que la
+    del despacho v2 (`{scheduledAtUtc, label, meetingLink}` — el shape real
+    del CRM, `server/agencia/bot-perfil.ts:proximaCita`, no incluye
+    `linkPending` hoy; se lee igual, por si el CRM lo agrega, y se queda en
+    `False` mientras no lo mande). Existe para un caso puntual pero real:
+    `create_booking`/`reschedule_booking` respondió 2xx pero el envío de la
+    confirmación agotó sus reintentos (v2 no tiene `pending_send` que la
     rescate — ver app/stateless._send) y el turno completo se reintenta. En
     ESE reintento, el catálogo de horarios ofrecidos (`OfferBook`) es nuevo y
     ya NO trae el horario reservado — sin esto, `_book_session` lo rechazaría
@@ -82,6 +85,7 @@ class AlreadyBooked:
     start_utc: datetime
     label: str
     meeting_url: str | None = None
+    link_pending: bool = False
 
 
 TOOL_SCHEMAS: list[dict[str, Any]] = [
@@ -274,6 +278,17 @@ class ToolRuntime:
         # lead, para reconocer un book_session/reschedule_session repetido
         # sobre ESE mismo horario como éxito idempotente, no como error.
         self._already_booked = already_booked
+        # True mientras `_already_booked` siga siendo el snapshot de
+        # `context.booking.next` que llegó ANTES de que este turno corriera
+        # una sola tool-call — es decir, mientras el atajo de abajo pueda
+        # seguir siendo un reintento LEGÍTIMO del despacho (el mismo turno,
+        # repetido porque el envío falló) y no una segunda tool-call sobre
+        # algo que ESTE turno acaba de reservar/mover por su cuenta. Se
+        # apaga en cuanto una reserva/movida de ESTE turno tiene éxito (ver
+        # `_book_session`): a partir de ahí, un tool-call repetido sobre el
+        # mismo horario es un error del modelo, no un reintento — y debe
+        # caer al camino normal (ofertados), nunca a otro atajo silencioso.
+        self._already_booked_is_retry_snapshot = already_booked is not None
         # Efectos observables por turn.py:
         self.handoff_reason: str | None = None  # se ejecuta DESPUÉS de la despedida
         self.booked = False
@@ -370,18 +385,28 @@ class ToolRuntime:
         )
         if chosen is None:
             already = self._already_booked
-            if already is not None and int(already.start_utc.timestamp()) == int(
-                wanted.timestamp()
+            if (
+                self._already_booked_is_retry_snapshot
+                and already is not None
+                and int(already.start_utc.timestamp()) == int(wanted.timestamp())
             ):
-                # Reintento tras un envío de confirmación que nunca llegó: la
-                # reserva YA existe (create_booking/reschedule_booking del
-                # CRM son idempotentes por conversación+startUtc) y este
-                # catálogo — nuevo en este intento — no la re-ofrece porque
-                # ya está ocupada. Éxito idempotente, SIN tocar el CRM de
-                # nuevo: nunca un segundo intento de reservar el mismo hueco.
+                # Reintento del DESPACHO (no de este turno): la reserva YA
+                # existía ANTES de que este turno corriera una sola tool-call
+                # (create_booking/reschedule_booking del CRM son idempotentes
+                # por conversación+startUtc) y este catálogo — nuevo en este
+                # intento — no la re-ofrece porque ya está ocupada. Éxito
+                # idempotente, SIN tocar el CRM de nuevo.
+                #
+                # `_already_booked_is_retry_snapshot` es lo que evita que
+                # esto se vuelva un atajo general: en cuanto ESTE turno
+                # reserva o mueve algo por su cuenta se apaga (ver el final
+                # del método) — una SEGUNDA tool-call sobre ese mismo valor,
+                # dentro del MISMO turno, es un error del modelo, no un
+                # reintento, y cae al camino normal (ofertados) de abajo.
                 logger.info(
-                    "tools: %s ya está agendado (context.booking.next) — "
-                    "éxito idempotente, sin reservar de nuevo",
+                    "tools: %s ya está agendado (context.booking.next, "
+                    "reintento del despacho) — éxito idempotente, sin "
+                    "reservar de nuevo",
                     args.get("start_utc"),
                 )
                 self.booked = True
@@ -389,7 +414,7 @@ class ToolRuntime:
                     "ok": True,
                     "label": already.label,
                     "meeting_url": already.meeting_url,
-                    "link_pendiente": False,
+                    "link_pendiente": already.link_pending,
                     "movida": mover,
                     "instrucciones": (
                         "confirma día y hora de la cita y menciona lo que el "
@@ -454,13 +479,31 @@ class ToolRuntime:
                 )
             except CrmError as exc:  # best-effort: la cita ya existe
                 logger.warning("tools: no pude actualizar ficha tras booking: %s", exc)
+        label = result.get("label") or chosen.label
+        # `meetingLink` es el nombre del CRM desde el motor de agenda
+        # universal; `zoomJoinUrl` era del conector único de antes.
+        meeting_url = result.get("meetingLink") or result.get("zoomJoinUrl")
+        link_pendiente = bool(result.get("linkPending"))
+        # Refresca el snapshot con lo que ESTE turno acaba de confirmar, y
+        # apaga la bandera de "reintento del despacho" (ver __init__): a
+        # partir de aquí, este valor lo puso ESTE turno, no un intento
+        # anterior — una tool-call repetida sobre él debe caer al camino
+        # normal (ofertados), no a otro atajo silencioso. Sin refrescar el
+        # valor mismo, un reschedule T1→T2 seguido de otro T2→T1 en el MISMO
+        # turno seguiría comparando contra el T1 viejo — la regresión real
+        # que este bloque corrige.
+        self._already_booked = AlreadyBooked(
+            start_utc=chosen.start_utc,
+            label=label,
+            meeting_url=meeting_url,
+            link_pending=link_pendiente,
+        )
+        self._already_booked_is_retry_snapshot = False
         return {
             "ok": True,
-            "label": result.get("label") or chosen.label,
-            # `meetingLink` es el nombre del CRM desde el motor de agenda
-            # universal; `zoomJoinUrl` era del conector único de antes.
-            "meeting_url": result.get("meetingLink") or result.get("zoomJoinUrl"),
-            "link_pendiente": bool(result.get("linkPending")),
+            "label": label,
+            "meeting_url": meeting_url,
+            "link_pendiente": link_pendiente,
             "movida": mover,
             "instrucciones": (
                 "confirma día y hora de la cita y menciona lo que el negocio "

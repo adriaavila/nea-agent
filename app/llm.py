@@ -9,8 +9,12 @@ Gotchas del brief que se honran aquí:
 - 401/402 (o 429 `insufficient_quota`) NO reintentan aquí: son responsabilidad
   del LLAMADOR (app/stateless.py, PR 2B) que decide caer a la clave de la
   plataforma y reportarlo — reintentar contra la MISMA clave rota solo quema
-  tiempo. El 403 de OpenRouter es moderación de contenido, no credenciales:
-  se trata como cualquier otro error (reintenta, no cae a otra clave).
+  tiempo. Un 403 de OpenRouter es AMBIGUO: casi siempre moderación de
+  contenido (se trata como cualquier otro error, reintenta, no cae a otra
+  clave), pero un 403 cuyo MENSAJE menciona el límite de gasto de esa clave
+  ("Key limit exceeded" y variantes — sin código de error aparte, a
+  diferencia del `insufficient_quota` de OpenAI) sí es un problema de
+  credenciales y cae a la plataforma igual que un 402.
 """
 from __future__ import annotations
 
@@ -104,16 +108,37 @@ def _formato_de_audio(mime: str) -> str:
     return _FORMATOS_AUDIO.get((mime or "").split(";")[0].strip().lower(), "ogg")
 
 
+def _mensaje_de_error(exc: APIStatusError) -> str:
+    """El mensaje del sobre de error, sin el `Error code: N - {...}` que le
+    antepone el SDK — de ahí sale, no de `exc.code` (OpenRouter no manda un
+    código aparte para "sin crédito de ESTA clave", solo lo dice en el
+    mensaje)."""
+    body = exc.body if isinstance(exc.body, dict) else {}
+    mensaje = body.get("message") if isinstance(body, dict) else None
+    return str(mensaje or exc.message or "")
+
+
+def _es_limite_de_clave(exc: APIStatusError) -> bool:
+    """El 403 de OpenRouter por límite de GASTO de esa clave puntual ("Key
+    limit exceeded" y variantes) no tiene un código aparte como el
+    `insufficient_quota` de OpenAI — se anuncia en el MENSAJE. Cualquier
+    otro 403 sigue siendo moderación de contenido, no credenciales."""
+    mensaje = _mensaje_de_error(exc).lower()
+    return "limit" in mensaje or "credit" in mensaje
+
+
 def _sin_reintento(exc: APIStatusError) -> type[Exception] | None:
-    """401/402, o 429 `insufficient_quota`: la clave no sirve — reintentar
-    contra ELLA MISMA no cambia nada. `None` = error normal (reintenta como
-    cualquier otro, incluido el 403 de moderación de OpenRouter, que NO es
-    un problema de credenciales)."""
+    """401/402, 429 `insufficient_quota`, o un 403 de OpenRouter por límite
+    de gasto de la clave: la clave no sirve — reintentar contra ELLA MISMA
+    no cambia nada. `None` = error normal (reintenta como cualquier otro,
+    incluido un 403 que SÍ es moderación de contenido)."""
     if exc.status_code == 401:
         return LlmAuthFailed
     if exc.status_code == 402:
         return LlmNoCredits
     if exc.status_code == 429 and exc.code == "insufficient_quota":
+        return LlmNoCredits
+    if exc.status_code == 403 and _es_limite_de_clave(exc):
         return LlmNoCredits
     return None
 
