@@ -230,6 +230,46 @@ class Store(Protocol):
     async def aclose(self) -> None: ...
 
 
+# ------------------------------------------------------------ sin base ---
+
+
+class NullStore:
+    """Store que revienta ante CUALQUIER llamada — nunca debería tocarse.
+
+    Dos usos:
+    - Arranque `DISPATCH_ONLY=true` sin `DATABASE_URL` (app/main.py): el modo
+      v1/legacy queda inhabilitado (dispatch.py responde 503 antes de llegar
+      aquí), pero si algo se coló, esto revienta fuerte en vez de fallar en
+      silencio contra una base inexistente.
+    - Tests del despacho v2 (app/stateless.py): certifican que ESE camino
+      jamás usa la base — se le inyecta este Store y cualquier llamada hace
+      fallar el test con un traceback claro, no un error de conexión opaco.
+
+    `__getattr__` cubre TODO el protocolo `Store` (y cualquiera que se le
+    agregue después) sin listar los ~20 métodos uno por uno. Excepción:
+    `aclose` (y `ping`) son ciclo de vida, no datos — el apagado del proceso
+    los llama SIEMPRE exista o no una base real, así que aquí son no-ops en
+    vez de reventar.
+    """
+
+    _NOOP = frozenset({"aclose", "ping"})
+
+    def __getattr__(self, name: str) -> Any:
+        if name in self._NOOP:
+            async def _noop(*args: Any, **kwargs: Any) -> None:
+                return None
+
+            return _noop
+
+        async def _revienta(*args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError(
+                f"NullStore.{name}: esta instancia no tiene base de datos — "
+                "esta llamada nunca debió ocurrir"
+            )
+
+        return _revienta
+
+
 # ------------------------------------------------------- fake en memoria ---
 
 

@@ -8,8 +8,9 @@ turno.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Protocol
 
 from app.crm import AgendaUnavailable, CrmError, SlotTaken
 from app.profile import BusinessProfile
@@ -18,6 +19,74 @@ from app.state import AppContext, Conversation, OfferedSlot, TurnCommit
 logger = logging.getLogger("nea.tools")
 
 MAX_OFFERED = 3
+
+
+class OfferBook(Protocol):
+    """Dónde vive "lo que ya se le ofreció a este lead" — el catálogo que
+    `book_session` valida por epoch exacto (ver `_book_session`). Dos
+    implementaciones: una respaldada por el Store (v1/legacy, la de
+    siempre) y una puramente en memoria (despacho v2, sembrada de
+    `payload.offers` — sin base de datos que tocar)."""
+
+    async def get(self) -> list[OfferedSlot]: ...
+    async def replace(self, slots: list[OfferedSlot]) -> None: ...
+    async def clear(self) -> None: ...
+
+
+class StoreOfferBook:
+    """Adaptador delgado sobre el Store — el camino de siempre (v1/legacy)."""
+
+    def __init__(self, store: Any, conversation_id: int) -> None:
+        self._store = store
+        self._conversation_id = conversation_id
+
+    async def get(self) -> list[OfferedSlot]:
+        return await self._store.get_offered_slots(self._conversation_id)
+
+    async def replace(self, slots: list[OfferedSlot]) -> None:
+        await self._store.replace_offered_slots(self._conversation_id, slots)
+
+    async def clear(self) -> None:
+        await self._store.clear_offered_slots(self._conversation_id)
+
+
+class MemoryOfferBook:
+    """Catálogo en memoria, vivo solo durante ESTE turno (despacho v2): se
+    siembra de `payload.offers` y `propose_slots` lo reemplaza — jamás toca
+    el Store (Nea no guarda nada en v2)."""
+
+    def __init__(self, initial: list[OfferedSlot] | None = None) -> None:
+        self._slots = list(initial or [])
+
+    async def get(self) -> list[OfferedSlot]:
+        return list(self._slots)
+
+    async def replace(self, slots: list[OfferedSlot]) -> None:
+        self._slots = list(slots)
+
+    async def clear(self) -> None:
+        self._slots = []
+
+
+@dataclass
+class AlreadyBooked:
+    """La cita YA agendada de este lead, tal como la trae `context.booking.next`
+    del despacho v2 (`{scheduledAtUtc, label, meetingLink}` — el shape real
+    del CRM, `server/agencia/bot-perfil.ts:proximaCita`, no incluye
+    `linkPending` hoy; se lee igual, por si el CRM lo agrega, y se queda en
+    `False` mientras no lo mande). Existe para un caso puntual pero real:
+    `create_booking`/`reschedule_booking` respondió 2xx pero el envío de la
+    confirmación agotó sus reintentos (v2 no tiene `pending_send` que la
+    rescate — ver app/stateless._send) y el turno completo se reintenta. En
+    ESE reintento, el catálogo de horarios ofrecidos (`OfferBook`) es nuevo y
+    ya NO trae el horario reservado — sin esto, `_book_session` lo rechazaría
+    como "no ofrecido" e intentaría reservar una SEGUNDA vez."""
+
+    start_utc: datetime
+    label: str
+    meeting_url: str | None = None
+    link_pending: bool = False
+
 
 TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
@@ -185,16 +254,41 @@ class ToolRuntime:
     def __init__(
         self,
         ctx: AppContext,
-        conv: Conversation,
+        conv: Conversation | None,
         crm_conversation_id: str,
         profile: BusinessProfile | None = None,
         commit: TurnCommit | None = None,
+        offers: OfferBook | None = None,
+        already_booked: AlreadyBooked | None = None,
     ) -> None:
         self._ctx = ctx
         self._conv = conv
         self._crm_conv_id = crm_conversation_id
         self._profile = profile or BusinessProfile()
         self._commit = commit
+        # v1/legacy (offers=None, comportamiento de SIEMPRE): respaldado por
+        # el Store, requiere un `conv` real. v2 (despacho sin estado) siempre
+        # pasa su propio MemoryOfferBook — `conv` puede venir None.
+        conv_id = conv.id if conv is not None else 0
+        self._offers: OfferBook = offers or StoreOfferBook(ctx.store, conv_id)
+        # Solo para ESTAMPAR OfferedSlot.conversation_id (metadato informativo
+        # de _slots_from_payload; las búsquedas reales van por self._offers).
+        self._conv_id_for_slots = conv_id
+        # None salvo en v2 (ver AlreadyBooked): la cita YA agendada de este
+        # lead, para reconocer un book_session/reschedule_session repetido
+        # sobre ESE mismo horario como éxito idempotente, no como error.
+        self._already_booked = already_booked
+        # True mientras `_already_booked` siga siendo el snapshot de
+        # `context.booking.next` que llegó ANTES de que este turno corriera
+        # una sola tool-call — es decir, mientras el atajo de abajo pueda
+        # seguir siendo un reintento LEGÍTIMO del despacho (el mismo turno,
+        # repetido porque el envío falló) y no una segunda tool-call sobre
+        # algo que ESTE turno acaba de reservar/mover por su cuenta. Se
+        # apaga en cuanto una reserva/movida de ESTE turno tiene éxito (ver
+        # `_book_session`): a partir de ahí, un tool-call repetido sobre el
+        # mismo horario es un error del modelo, no un reintento — y debe
+        # caer al camino normal (ofertados), nunca a otro atajo silencioso.
+        self._already_booked_is_retry_snapshot = already_booked is not None
         # Efectos observables por turn.py:
         self.handoff_reason: str | None = None  # se ejecuta DESPUÉS de la despedida
         self.booked = False
@@ -244,14 +338,14 @@ class ToolRuntime:
                 "error": "sin_agenda",
                 "detalle": "esta instancia no agenda; usa handoff para coordinar directo",
             }
-        slots = _slots_from_payload(self._conv.id, payload["slots"])
+        slots = _slots_from_payload(self._conv_id_for_slots, payload["slots"])
         if not slots:
             return {
                 "ok": False,
                 "error": "sin_disponibilidad",
                 "detalle": "no hay horarios abiertos; ofrece handoff para coordinar directo",
             }
-        await self._ctx.store.replace_offered_slots(self._conv.id, slots)
+        await self._offers.replace(slots)
         self.proposed = True
         return {
             "ok": True,
@@ -277,7 +371,7 @@ class ToolRuntime:
         los mismos 409. Duplicarlo sería duplicar también los errores.
         """
         wanted = _parse_utc(str(args.get("start_utc") or ""))
-        offered = await self._ctx.store.get_offered_slots(self._conv.id)
+        offered = await self._offers.get()
         if wanted is None:
             return {
                 "ok": False,
@@ -290,6 +384,44 @@ class ToolRuntime:
             None,
         )
         if chosen is None:
+            already = self._already_booked
+            if (
+                self._already_booked_is_retry_snapshot
+                and already is not None
+                and int(already.start_utc.timestamp()) == int(wanted.timestamp())
+            ):
+                # Reintento del DESPACHO (no de este turno): la reserva YA
+                # existía ANTES de que este turno corriera una sola tool-call
+                # (create_booking/reschedule_booking del CRM son idempotentes
+                # por conversación+startUtc) y este catálogo — nuevo en este
+                # intento — no la re-ofrece porque ya está ocupada. Éxito
+                # idempotente, SIN tocar el CRM de nuevo.
+                #
+                # `_already_booked_is_retry_snapshot` es lo que evita que
+                # esto se vuelva un atajo general: en cuanto ESTE turno
+                # reserva o mueve algo por su cuenta se apaga (ver el final
+                # del método) — una SEGUNDA tool-call sobre ese mismo valor,
+                # dentro del MISMO turno, es un error del modelo, no un
+                # reintento, y cae al camino normal (ofertados) de abajo.
+                logger.info(
+                    "tools: %s ya está agendado (context.booking.next, "
+                    "reintento del despacho) — éxito idempotente, sin "
+                    "reservar de nuevo",
+                    args.get("start_utc"),
+                )
+                self.booked = True
+                return {
+                    "ok": True,
+                    "label": already.label,
+                    "meeting_url": already.meeting_url,
+                    "link_pendiente": already.link_pending,
+                    "movida": mover,
+                    "instrucciones": (
+                        "confirma día y hora de la cita y menciona lo que el "
+                        "negocio pida para llegar preparado. Si hay "
+                        "meeting_url, compártelo."
+                    ),
+                }
             logger.info(
                 "tools: book_session rechazado — %s no está entre los ofrecidos",
                 args.get("start_utc"),
@@ -326,8 +458,8 @@ class ToolRuntime:
             # Se ocupó entre oferta y elección, o el CRM no reconoce el
             # instante como ofrecido. Misma salida: alternativas frescas del
             # propio CRM, nunca discutir con el lead.
-            fresh = _slots_from_payload(self._conv.id, exc.slots)
-            await self._ctx.store.replace_offered_slots(self._conv.id, fresh)
+            fresh = _slots_from_payload(self._conv_id_for_slots, exc.slots)
+            await self._offers.replace(fresh)
             return {
                 "ok": False,
                 "error": exc.code,
@@ -338,7 +470,7 @@ class ToolRuntime:
                 ),
                 "slots": _slots_for_llm(fresh),
             }
-        await self._ctx.store.clear_offered_slots(self._conv.id)
+        await self._offers.clear()
         self.booked = True
         if not mover:
             try:
@@ -347,13 +479,31 @@ class ToolRuntime:
                 )
             except CrmError as exc:  # best-effort: la cita ya existe
                 logger.warning("tools: no pude actualizar ficha tras booking: %s", exc)
+        label = result.get("label") or chosen.label
+        # `meetingLink` es el nombre del CRM desde el motor de agenda
+        # universal; `zoomJoinUrl` era del conector único de antes.
+        meeting_url = result.get("meetingLink") or result.get("zoomJoinUrl")
+        link_pendiente = bool(result.get("linkPending"))
+        # Refresca el snapshot con lo que ESTE turno acaba de confirmar, y
+        # apaga la bandera de "reintento del despacho" (ver __init__): a
+        # partir de aquí, este valor lo puso ESTE turno, no un intento
+        # anterior — una tool-call repetida sobre él debe caer al camino
+        # normal (ofertados), no a otro atajo silencioso. Sin refrescar el
+        # valor mismo, un reschedule T1→T2 seguido de otro T2→T1 en el MISMO
+        # turno seguiría comparando contra el T1 viejo — la regresión real
+        # que este bloque corrige.
+        self._already_booked = AlreadyBooked(
+            start_utc=chosen.start_utc,
+            label=label,
+            meeting_url=meeting_url,
+            link_pending=link_pendiente,
+        )
+        self._already_booked_is_retry_snapshot = False
         return {
             "ok": True,
-            "label": result.get("label") or chosen.label,
-            # `meetingLink` es el nombre del CRM desde el motor de agenda
-            # universal; `zoomJoinUrl` era del conector único de antes.
-            "meeting_url": result.get("meetingLink") or result.get("zoomJoinUrl"),
-            "link_pendiente": bool(result.get("linkPending")),
+            "label": label,
+            "meeting_url": meeting_url,
+            "link_pendiente": link_pendiente,
             "movida": mover,
             "instrucciones": (
                 "confirma día y hora de la cita y menciona lo que el negocio "

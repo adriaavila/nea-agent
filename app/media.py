@@ -157,11 +157,22 @@ async def _location(ctx: AppContext, msg: InboundMessage) -> MediaPart:
     detalles = ", ".join(
         str(loc[k]) for k in ("name", "address") if loc.get(k)
     )
-    coords = f"lat {loc.get('latitude')}, long {loc.get('longitude')}"
-    prefix = f"{detalles} — " if detalles else ""
+    lat, lon = loc.get("latitude"), loc.get("longitude")
+    # Nunca "lat None, long None": sin coordenadas reales, se cae al nombre/
+    # dirección si hay, o a un aviso honesto — jamás un hueco relleno con None.
+    coords = f"lat {lat}, long {lon}" if lat is not None and lon is not None else None
+    if coords is None and not detalles:
+        return MediaPart(
+            text=(
+                "[El lead compartió su ubicación, pero no llegaron las"
+                " coordenadas. Si te dice de dónde es, guarda la zona en la"
+                " ficha (geo).]"
+            )
+        )
+    cuerpo = f"{detalles} — {coords}" if detalles and coords else (coords or detalles)
     return MediaPart(
         text=(
-            f"[El lead compartió su ubicación: {prefix}{coords}. Si te dice de"
+            f"[El lead compartió su ubicación: {cuerpo}. Si te dice de"
             " dónde es o ya lo sabes, guarda la zona en la ficha (geo).]"
         )
     )

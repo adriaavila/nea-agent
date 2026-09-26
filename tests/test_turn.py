@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 
-from app.llm import LlmExhausted, LlmReply, ToolCall
+from app.llm import LlmExhausted, LlmNoCredits, LlmReply, ToolCall
 from app.profile import BusinessProfile
 from app.sender import SenderWorker
 from tests.conftest import CRM_CONV_ID, IDENTITY, mock_crm_basics, wa_body
@@ -74,6 +74,31 @@ async def test_llm_agotado_silencio_mas_handoff_error(ctx, client, respx_mock):
     assert body["reason"] == "error"
     # el relay a la bandeja quedó intacto
     assert len(ctx.store.relays) == 1
+
+
+async def test_v1_402_del_proveedor_degrada_igual_que_agotado(ctx, client, respx_mock):
+    """Regresión (revisión de PR 2B): `LlmAuthFailed`/`LlmNoCredits` (401/402/
+    429 insufficient_quota, ver app/llm.py) ahora se levantan para que v2
+    decida el fallback a la plataforma — pero app/turn.py (v1/legacy) solo
+    atrapa `LlmExhausted` alrededor de `_tool_loop`. Sin que las dos hereden
+    de `LlmExhausted`, un 402 real contra la clave de ESTE despliegue (nadie
+    está a salvo de una que se quede sin crédito) escaparía SIN degradar:
+    nada de silencio, nada de handoff, nada de fase `cerrada` — justo lo que
+    `test_llm_agotado_silencio_mas_handoff_error` (arriba) verifica para un
+    `LlmExhausted` directo. Mismo resultado, ahora también con `LlmNoCredits`."""
+    routes = mock_crm_basics(respx_mock)
+    ctx.llm.raise_exc = LlmNoCredits("402 de la clave de este despliegue")
+
+    resp = await client.post("/webhook", content=wa_body(text="hola"))
+    assert resp.status_code == 200  # el webhook JAMÁS falla por el LLM
+    await asyncio.sleep(0.25)
+
+    assert routes["messages"].call_count == 0  # nada roto al lead
+    assert routes["handoff"].call_count == 1
+    body = json.loads(routes["handoff"].calls[0].request.content)
+    assert body["reason"] == "error"
+    conv = next(iter(ctx.store.conversations.values()))
+    assert conv.phase == "cerrada"
 
 
 async def test_turno_programa_seguimiento(ctx, client, respx_mock):

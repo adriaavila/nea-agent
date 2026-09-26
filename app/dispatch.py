@@ -38,6 +38,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
+from app import stateless
 from app.config import canonical_identity
 from app.multiorg import scoped_ctx
 from app.state import AppContext, InboundMessage, TurnCommit
@@ -51,6 +52,13 @@ router = APIRouter()
 # ANTES de eso para poder soltar los ids reclamados nosotros mismos en vez de
 # dejar la conexión colgada hasta que el CRM decida que se cortó.
 DISPATCH_TIMEOUT_SECONDS = 75.0
+
+
+def _error_locations(exc: ValidationError) -> list[str]:
+    """Solo las UBICACIONES del error de validación (p.ej. "llm.apiKey"),
+    NUNCA el valor — un payload v2 con un `apiKey` mal tipado no debe
+    terminar impreso en el log por loguear el ValidationError completo."""
+    return [".".join(str(p) for p in e.get("loc", ())) for e in exc.errors()]
 
 
 # ------------------------------------------------------------------ tipos ---
@@ -196,6 +204,11 @@ def _log_background_outcome(organization_id: str, conversation_id: str):
 
 @router.post("/dispatch")
 async def dispatch(request: Request) -> Any:
+    """Enruta por `version`: sin ella, o `1`, es el camino v1/legacy de
+    siempre (`_dispatch_v1`, sin tocar); `2` es el despacho sin estado
+    (`_dispatch_v2` → app/stateless.py, que NUNCA usa `ctx.store`). La firma,
+    el parseo del cuerpo y el límite de tamaño de versión soportada son
+    comunes a las dos."""
     ctx: AppContext = request.app.state.ctx
     body = await request.body()
     signature = request.headers.get("x-signature")
@@ -211,10 +224,38 @@ async def dispatch(request: Request) -> Any:
     if not isinstance(raw_payload, dict):
         return JSONResponse({"error": "cuerpo inesperado"}, status_code=400)
 
+    version = raw_payload.get("version")
+    if version not in (None, 1, 2):
+        logger.warning("dispatch: version %r no soportada — 400", version)
+        return JSONResponse({"error": "version no soportada"}, status_code=400)
+    if version == 2:
+        return await _dispatch_v2(ctx, raw_payload)
+    return await _dispatch_v1(ctx, raw_payload)
+
+
+async def _dispatch_v1(ctx: AppContext, raw_payload: dict[str, Any]) -> Any:
+    """Camino v1/legacy — comportamiento IDÉNTICO al de antes de dispatch v2,
+    solo que ahora vive en su propia función. Usa `ctx.store` (dedup,
+    `bot_conversation`, `bot_message`, `pending_send`): con `DISPATCH_ONLY=true`
+    y sin `DATABASE_URL` (ver app/main.py) no hay Store real que tocar, así
+    que se corta ANTES de intentarlo — 503, claro, en vez de un error de
+    conexión opaco contra una base que no existe."""
+    if ctx.settings.dispatch_only and not ctx.settings.database_url:
+        logger.warning(
+            "dispatch v1: instancia sin base de datos (DISPATCH_ONLY sin "
+            "DATABASE_URL) — 503, el CRM debe mandar version=2"
+        )
+        return JSONResponse(
+            {"error": "v1 no disponible: esta instancia corre sin base de datos"},
+            status_code=503,
+        )
+
     try:
         payload = DispatchPayload.model_validate(raw_payload)
     except ValidationError as exc:
-        logger.warning("dispatch: cuerpo con tipos inválidos — 400 (%s)", exc)
+        logger.warning(
+            "dispatch: cuerpo con tipos inválidos — 400 (%s)", _error_locations(exc)
+        )
         return JSONResponse({"error": "cuerpo con tipos inválidos"}, status_code=400)
 
     organization_id = (payload.organizationId or "").strip()
@@ -357,3 +398,107 @@ async def dispatch(request: Request) -> Any:
     finally:
         if not handled and not commit.done:
             await _release_claimed_ids(ctx, claimed_ids)
+
+
+def _v2_body(result: "stateless.V2Result | None") -> dict[str, Any]:
+    """El sobre de respuesta del contrato v2. `None` (timeout/fallo tras
+    comprometerse, ver `_dispatch_v2`): no sabemos en qué quedó el resto del
+    turno en segundo plano — se contesta lo mínimo honesto, `ok` a secas."""
+    if result is None:
+        return {"ok": True}
+    return {
+        "ok": True,
+        "action": result.action,
+        # `source` es del contrato: de quién es la clave que el CRM evalúa
+        # para invalidar (server/ai/pipeline.ts:applyNeaResponse — solo si
+        # source==="org"). `answeredWith` es un extra informativo (fuera del
+        # contrato mínimo, pero el CRM tolera campos de más — no hay
+        # validación estricta del body de Nea) con quién contestó de verdad.
+        "llm": {
+            "source": result.llm_source,
+            "status": result.llm_status,
+            "answeredWith": result.llm_answered_with,
+        },
+        "handoff": (
+            {"reason": result.handoff_reason, "applied": bool(result.handoff_applied)}
+            if result.handoff_reason is not None
+            else None
+        ),
+    }
+
+
+async def _dispatch_v2(ctx: AppContext, raw_payload: dict[str, Any]) -> Any:
+    """Despacho v2: mismo candado por (organización, identidad) y el mismo
+    límite de 75 s que v1 — pero SIN dedup por mark_processed/release_processed:
+    el CRM ya dedupea sus reintentos por `dispatchId` (mensajes idempotentes,
+    PR 2A), así que aquí no hay ids que reclamar ni soltar. El turno en sí
+    (app/stateless.run_turn) NUNCA toca `ctx.store`."""
+    try:
+        payload = stateless.DispatchPayloadV2.model_validate(raw_payload)
+    except ValidationError as exc:
+        logger.warning(
+            "dispatch v2: cuerpo con tipos inválidos — 400 (%s)", _error_locations(exc)
+        )
+        return JSONResponse({"error": "cuerpo con tipos inválidos"}, status_code=400)
+
+    organization_id = (payload.organizationId or "").strip()
+    conversation_id = (payload.conversationId or "").strip()
+    if not organization_id or not conversation_id:
+        logger.warning("dispatch v2: sin organizationId/conversationId — 400")
+        return JSONResponse(
+            {"error": "organizationId y conversationId son obligatorios"},
+            status_code=400,
+        )
+
+    identity = stateless.turn_identity(payload)
+    lock = _lock_for(ctx, organization_id, identity)
+    commit = TurnCommit()
+
+    async def _run() -> "stateless.V2Result":
+        async with lock:
+            return await stateless.run_turn(
+                ctx, payload, organization_id=organization_id, commit=commit
+            )
+
+    task: "asyncio.Task[stateless.V2Result]" = asyncio.create_task(_run())
+    task.add_done_callback(_log_background_outcome(organization_id, conversation_id))
+
+    try:
+        result = await asyncio.wait_for(asyncio.shield(task), timeout=DISPATCH_TIMEOUT_SECONDS)
+    except TimeoutError:
+        if commit.done:
+            logger.error(
+                "dispatch v2 %s/%s: tardó más de %.0f s DESPUÉS de "
+                "comprometerse (ya se le respondió al lead) — 200, el turno "
+                "sigue en segundo plano",
+                organization_id,
+                conversation_id,
+                DISPATCH_TIMEOUT_SECONDS,
+            )
+            return _v2_body(None)
+        logger.error(
+            "dispatch v2 %s/%s: tardó más de %.0f s ANTES de comprometerse "
+            "— 500",
+            organization_id,
+            conversation_id,
+            DISPATCH_TIMEOUT_SECONDS,
+        )
+        task.cancel()
+        return JSONResponse({"error": "el turno tardó demasiado"}, status_code=500)
+    except Exception:
+        if commit.done:
+            logger.exception(
+                "dispatch v2 %s/%s: falló DESPUÉS de comprometerse (ya se le "
+                "respondió al lead) — 200 para NO reintentar y duplicar",
+                organization_id,
+                conversation_id,
+            )
+            return _v2_body(None)
+        logger.exception(
+            "dispatch v2 %s/%s: el turno reventó ANTES de comprometerse — "
+            "500 para que el CRM reintente",
+            organization_id,
+            conversation_id,
+        )
+        return JSONResponse({"error": "el turno falló"}, status_code=500)
+    return _v2_body(result)

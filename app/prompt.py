@@ -200,6 +200,21 @@ def build_system_prompt(
     )
 
 
+#: Despacho v2 (app/stateless.py): el historial que manda el CRM incluye las
+#: respuestas del dueño/equipo del negocio (Nea antes no las veía). Se marcan
+#: con un prefijo y este mensaje de sistema aparte SOLO cuando hay al menos
+#: una — el chasis (`_chassis`) se queda intacto, esto es un añadido, no un
+#: reemplazo.
+TEAM_OWNER_MARKER_PREFIX = "[Respuesta de una persona del negocio]"
+
+TEAM_OWNER_NOTE = (
+    f'Los mensajes que empiezan con "{TEAM_OWNER_MARKER_PREFIX}" los escribió '
+    "un humano del equipo o el dueño del negocio, NO tú. Son contexto: no los "
+    "repitas ni los contradigas — sigue la conversación con naturalidad, "
+    "coherente con lo que esa persona ya dijo."
+)
+
+
 FOLLOWUP_INSTRUCTION = (
     "El lead lleva horas sin responder y la conversación quedó abierta. "
     "Escribe UN único mensaje corto de seguimiento: cálido, sin presión, retomando "
