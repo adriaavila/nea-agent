@@ -86,6 +86,13 @@ JAMÁS se sirve a otra. Sin coalesce (el CRM ya agrupó la ráfaga) y sin relay
 responde 200 solo al terminar (5xx si revienta o se cuelga, liberando los ids
 reclamados para que el reintento del CRM no los encuentre "ya procesados").
 
+El mismo `POST /dispatch` sirve también el seguimiento: `followup: true` en el
+payload es el ÚNICO empujón de las 4 h de silencio (antes un timer interno de
+Nea, `app/followup.py` — sigue vivo para despliegues legacy de un solo
+negocio) — en modo despacho lo dispara el CRM, dueño del temporizador. Nea
+solo decide SI corresponde (nunca reactiva un chat pausado, nunca llama
+herramientas ni hace handoff) y QUÉ decir; ver `app/stateless._run_followup`.
+
 **nea-santorini (producción, single-tenant) corre la rama `main`, NO esta
 rama** — la migración `003_org.sql` y el modo despacho todavía no la tocan.
 Cuando ese despliegue sí actualice a un commit con esta migración, el

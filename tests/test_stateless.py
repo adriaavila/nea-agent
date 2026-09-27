@@ -62,6 +62,7 @@ def v2_raw(
     organization_id: str | None = "org_a",
     conversation_id: str | None = "cv_v2_1",
     is_test: bool = False,
+    followup: bool = False,
     dispatch_id: str = "dsp_1",
     attempt: int = 0,
     ai_enabled: bool = True,
@@ -133,6 +134,7 @@ def v2_raw(
         "organizationId": organization_id,
         "conversationId": conversation_id,
         "isTest": is_test,
+        "followup": followup,
         # campos v1, deben ignorarse en v2 (se dejan para probar justamente eso)
         "contact": {"identity": identity, "name": "Lead de Prueba"},
         "messages": [],

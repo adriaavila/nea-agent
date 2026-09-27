@@ -13,6 +13,11 @@ idempotentes); aquí el único "estado" que existe vive y muere con el turno
 `app/dispatch.py` es quien decide, por `version`, si un despacho llega aquí o
 al camino v1/legacy (`app/turn.py`, sin tocar). Esa frontera la vigila un
 test con un Store que revienta ante cualquier llamada (`app.state.NullStore`).
+
+`payload.followup=True` es un despacho aparte, NO un turno: el ÚNICO empujón
+de las 4 h de silencio, con el CRM como dueño del temporizador (antes era
+`app/followup.py`, que dejó de correr aquí por depender de `ctx.store`). Ver
+`_run_followup`.
 """
 from __future__ import annotations
 
@@ -34,7 +39,12 @@ from app.hostility import ALERT as HOSTILITY_ALERT, hostile_streak
 from app.llm import Llm, LlmAuthFailed, LlmExhausted, LlmNoCredits, OpenAiLlm
 from app.multiorg import crm_for
 from app.profile import BusinessProfile, profile_from_payload
-from app.prompt import TEAM_OWNER_MARKER_PREFIX, TEAM_OWNER_NOTE, build_system_prompt
+from app.prompt import (
+    FOLLOWUP_INSTRUCTION,
+    TEAM_OWNER_MARKER_PREFIX,
+    TEAM_OWNER_NOTE,
+    build_system_prompt,
+)
 from app.state import AppContext, Conversation, InboundMessage, OfferedSlot, TurnCommit
 from app.tools import TOOL_SCHEMAS, AlreadyBooked, MemoryOfferBook, ToolRuntime
 from app.turn import _agent_tz
@@ -120,6 +130,11 @@ class DispatchPayloadV2(BaseModel):
     organizationId: str | None = None
     conversationId: str | None = None
     isTest: bool = False
+    # El CRM ahora es el dueño del temporizador de seguimiento (antes vivía en
+    # app/followup.py, que dejó de correr para negocios en modo despacho — ver
+    # `_run_followup`): con `True`, este despacho NO es un turno, es el ÚNICO
+    # empujón de las 4 h de silencio.
+    followup: bool = False
     context: dict[str, Any] = Field(default_factory=dict)
     profile: dict[str, Any] = Field(default_factory=dict)
     history: list[DispatchHistoryItemIn] = Field(default_factory=list)
@@ -131,6 +146,13 @@ class DispatchPayloadV2(BaseModel):
     def _is_test_debe_ser_bool(cls, v: Any) -> Any:
         if not isinstance(v, bool):
             raise ValueError("isTest debe ser boolean, no string/número")
+        return v
+
+    @field_validator("followup", mode="before")
+    @classmethod
+    def _followup_debe_ser_bool(cls, v: Any) -> Any:
+        if not isinstance(v, bool):
+            raise ValueError("followup debe ser boolean, no string/número")
         return v
 
 
@@ -546,10 +568,12 @@ def _build_org_llm(llm_in: DispatchLlmIn) -> OpenAiLlm:
 
 async def _tool_loop(
     messages: list[dict[str, Any]],
-    runtime: ToolRuntime,
+    runtime: ToolRuntime | None,
     org_llm: Llm | None,
     platform_llm: Llm,
     state: _LlmState,
+    *,
+    tools: list[dict[str, Any]] | None = TOOL_SCHEMAS,
 ) -> str | None:
     """Rondas de tool-calling hasta obtener texto final (o rendirse) — igual
     que app/turn.py._tool_loop, más el fallback de clave por negocio: si el
@@ -558,13 +582,21 @@ async def _tool_loop(
     (`active` es local a este loop: las rondas siguientes ya no vuelven a
     intentar la del negocio).
 
+    `tools`/`runtime`: el empujón de seguimiento (`_run_followup`) llama con
+    `tools=None` y `runtime=None` — sin catálogo de herramientas el proveedor
+    NUNCA puede devolver `tool_calls` (ver `OpenAiLlm.complete`: sin `tools`
+    ni siquiera se manda ese kwarg), así que el bloque de ejecución de abajo
+    no debería alcanzarse nunca en ese camino; si un proveedor rarísimo lo
+    hiciera igual, se corta sin texto en vez de reventar contra un runtime
+    ausente.
+
     Nota: `state.source` NUNCA se toca aquí — se fija una sola vez al armar
     `state` (ver `run_turn`) y representa de quién es la clave reportada, no
     quién contestó (ver `V2Result`)."""
     active = org_llm or platform_llm
     for _ in range(MAX_TOOL_ROUNDS):
         try:
-            reply = await active.complete(messages, tools=TOOL_SCHEMAS)
+            reply = await active.complete(messages, tools=tools)
         except (LlmAuthFailed, LlmNoCredits) as exc:
             status = "auth_failed" if isinstance(exc, LlmAuthFailed) else "no_credits"
             if active is platform_llm:
@@ -587,11 +619,19 @@ async def _tool_loop(
             )
             active = platform_llm
             try:
-                reply = await active.complete(messages, tools=TOOL_SCHEMAS)
+                reply = await active.complete(messages, tools=tools)
             except (LlmAuthFailed, LlmNoCredits) as exc2:
                 raise LlmExhausted(str(exc2)) from exc2
         if not reply.tool_calls:
             return reply.content
+        if runtime is None:
+            # Nunca debería pasar (ver el docstring): sin `tools`, el
+            # proveedor no tiene forma de generar una tool_call.
+            logger.error(
+                "stateless: el LLM devolvió tool_calls sin runtime (tools=None) "
+                "— corto sin texto"
+            )
+            return None
         messages.append(
             {
                 "role": "assistant",
@@ -707,6 +747,164 @@ async def _run_reset(
 # ------------------------------------------------------------------ turno ---
 
 
+async def _run_followup(
+    ctx: AppContext,
+    payload: DispatchPayloadV2,
+    *,
+    organization_id: str,
+    commit: TurnCommit | None,
+) -> V2Result:
+    """El ÚNICO empujón tras horas de silencio (`followup: true`), ahora
+    disparado por el CRM (dueño del temporizador) — reemplaza, para negocios
+    en modo despacho, al `FollowupWorker` de v1 (app/followup.py), que vive
+    de `ctx.store` y por eso dejó de correr para ellos desde dispatch v2 (ver
+    el docstring del módulo). Nea solo decide SI corresponde responder y QUÉ
+    decir; el CUÁNDO ya no es asunto suyo.
+
+    Puertas MÁS estrictas que las de un turno normal: jamás reactiva un chat
+    pausado (ni con frase activadora — esto no es un mensaje del lead), jamás
+    llama herramientas, jamás hace handoff ni escribe la ficha. Un empujón
+    que no salió no es un incidente — el lead sigue exactamente donde estaba
+    y el turno normal lo sigue atendiendo en cuanto vuelva a escribir."""
+    conversation_id = (payload.conversationId or "").strip()
+
+    if payload.isTest:
+        # Jamás se empuja una conversación del Laboratorio.
+        logger.info(
+            "stateless %s: followup de una conversación de prueba — noop",
+            conversation_id,
+        )
+        return V2Result(action="noop")
+
+    context = payload.context or {}
+    conv_info = context.get("conversation") or {}
+    identity = turn_identity(payload)
+    restricted, allowed = access_policy(ctx.settings, context)
+    if restricted and canonical_identity(identity) not in allowed:
+        logger.info(
+            "stateless %s: followup a %s no autorizado — silencio",
+            conversation_id,
+            identity,
+        )
+        return V2Result(action="silent")
+
+    if not conv_info.get("aiEnabled", False):
+        # A diferencia de un turno normal: un empujón NUNCA reactiva un chat
+        # pausado, ni siquiera si el perfil tiene frases activadoras — no es
+        # el lead quien está "hablando".
+        logger.info(
+            "stateless %s: followup con el chat pausado — silencio",
+            conversation_id,
+        )
+        return V2Result(action="silent")
+
+    if not conv_info.get("windowOpen", False):
+        logger.info(
+            "stateless %s: followup con la ventana de 24 h cerrada — silencio",
+            conversation_id,
+        )
+        return V2Result(action="silent")
+
+    history = payload.history
+    if not history or history[-1].role != "agent" or any(m.pending for m in history):
+        # El lead (o un humano del negocio) habló último, o quedó algo
+        # pendiente sin resolver: eso lo atiende el turno normal, no un
+        # empujón — y sin LLM de por medio.
+        logger.info(
+            "stateless %s: followup sin el agente hablando último (o con "
+            "algo pendiente) — noop",
+            conversation_id,
+        )
+        return V2Result(action="noop")
+
+    scoped_crm = crm_for(ctx, organization_id)
+    profile = profile_from_payload(payload.profile or {}, default_name=ctx.settings.agent_name)
+    history_messages, had_team_or_owner = _history_messages(history)
+    fake_conv = Conversation(id=0, wa_identity=identity or conversation_id, greeted=True)
+    system = build_system_prompt(
+        profile=profile,
+        context=context,
+        conv=fake_conv,
+        offered=_offers_from_payload(payload.offers),
+        tz=_agent_tz(ctx.settings, profile),
+    )
+    messages: list[dict[str, Any]] = [{"role": "system", "content": system}]
+    if had_team_or_owner:
+        messages.append({"role": "system", "content": TEAM_OWNER_NOTE})
+    messages += history_messages
+    messages.append({"role": "system", "content": FOLLOWUP_INSTRUCTION})
+
+    org_llm = _build_org_llm(payload.llm) if payload.llm is not None else None
+    # Igual que en `run_turn`: se fija UNA vez y no cambia (ver `_LlmState`).
+    state = _LlmState(
+        source="org" if org_llm is not None else "platform",
+        answered_with="org" if org_llm is not None else "platform",
+    )
+    try:
+        try:
+            final_text = await _tool_loop(
+                messages, None, org_llm, ctx.llm, state, tools=None
+            )
+        except LlmExhausted as exc:
+            # SIN handoff — a diferencia de un turno agotado: un empujón
+            # fallido no amerita pausar la conversación (Constitución IV).
+            logger.warning(
+                "stateless %s: followup — LLM agotó reintentos (%s) — "
+                "silencio sin handoff",
+                conversation_id,
+                exc,
+            )
+            return V2Result(
+                action="silent",
+                llm_source=state.source,
+                llm_status=state.status,
+                llm_answered_with=state.answered_with,
+            )
+    finally:
+        if org_llm is not None:
+            await org_llm.aclose()
+
+    if not final_text or not final_text.strip():
+        logger.info(
+            "stateless %s: followup — el modelo no devolvió texto — silencio",
+            conversation_id,
+        )
+        return V2Result(
+            action="silent",
+            llm_source=state.source,
+            llm_status=state.status,
+            llm_answered_with=state.answered_with,
+        )
+    texto = _strip_leaked_marker(final_text.strip())
+    if not texto:
+        logger.info(
+            "stateless %s: followup — la respuesta era solo el marcador "
+            "filtrado — silencio",
+            conversation_id,
+        )
+        return V2Result(
+            action="silent",
+            llm_source=state.source,
+            llm_status=state.status,
+            llm_answered_with=state.answered_with,
+        )
+
+    sent = await _send(
+        scoped_crm, conversation_id, texto, dispatch_id=payload.dispatchId, commit=commit
+    )
+    logger.info(
+        "stateless %s: followup %s",
+        conversation_id,
+        "enviado" if sent else "bloqueado por el CRM",
+    )
+    return V2Result(
+        action="replied" if sent else "silent",
+        llm_source=state.source,
+        llm_status=state.status,
+        llm_answered_with=state.answered_with,
+    )
+
+
 async def run_turn(
     ctx: AppContext,
     payload: DispatchPayloadV2,
@@ -715,7 +913,17 @@ async def run_turn(
     commit: TurnCommit | None = None,
 ) -> V2Result:
     """Corre UN turno v2 completo. `ctx.store` NUNCA se toca — todo lo que se
-    necesita ya viene en `payload` (ver el docstring del módulo)."""
+    necesita ya viene en `payload` (ver el docstring del módulo).
+
+    `payload.followup=True`: esto no es un turno, es el empujón único de las
+    4 h de silencio que el CRM programa y dispara — se resuelve aparte, en
+    `_run_followup`, con sus propias puertas (más estrictas que las de
+    abajo) y el resto de esta función queda intacto."""
+    if payload.followup:
+        return await _run_followup(
+            ctx, payload, organization_id=organization_id, commit=commit
+        )
+
     context = payload.context or {}
     conv_info = dict(context.get("conversation") or {})
     conversation_id = (payload.conversationId or "").strip()
