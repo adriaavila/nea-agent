@@ -440,6 +440,18 @@ def _strip_leaked_marker(text: str) -> str:
     return _LEAKED_MARKER_RE.sub("", text.lstrip(), count=1)
 
 
+# Sin DOTALL: la negrita de WhatsApp nunca cruza un salto de línea, y un `**`
+# huérfano no debe emparejarse con el de la línea siguiente.
+_MD_BOLD_RE = re.compile(r"\*{2,3}(\S(?:[^\n]*?\S)?)\*{2,3}")
+
+
+def _whatsapp_format(text: str) -> str:
+    """El chasis pide texto plano, pero el modelo a veces escribe `**negrita**`
+    de Markdown: en WhatsApp llega con los asteriscos a la vista. La negrita de
+    WhatsApp es de un solo asterisco."""
+    return _MD_BOLD_RE.sub(r"*\1*", text)
+
+
 def _burst_text(item: DispatchHistoryItemIn) -> str | None:
     """El texto de UN mensaje del lead para el conteo de hostilidad: el texto
     tal cual, o — para una nota de voz sin texto propio — su transcripción.
@@ -870,7 +882,7 @@ async def run_turn(
         # El modelo ve el marcador de equipo/dueño en su propio historial y a
         # veces lo repite — nunca debe llegarle al lead (ver
         # `_strip_leaked_marker`).
-        texto = _strip_leaked_marker(final_text.strip())
+        texto = _whatsapp_format(_strip_leaked_marker(final_text.strip()))
         if not texto:
             # El modelo solo repitió el marcador (o una variante) y no dijo
             # NADA más — un 200 silencioso aquí sería peor que agotado: nadie

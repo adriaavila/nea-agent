@@ -12,7 +12,7 @@ from app.profile import (
     profile_from_payload,
     resolve_profile,
 )
-from app.prompt import build_system_prompt
+from app.prompt import _chassis, build_system_prompt
 from app.state import Conversation
 
 
@@ -129,6 +129,51 @@ def test_prompt_compone_chasis_y_negocio():
     assert "route_out" in system
     assert "hostilidad" in system  # el chasis conserva la regla de 3 strikes
     assert "OJO: el negocio aún no configuró" not in system
+
+
+_CONTEXTO_ANUNCIO_Y_CITA = {
+    "adOrigen": {"headline": "De consulta a cita"},
+    "booking": {"next": {"label": "martes 29, 10:00"}},
+}
+
+
+def test_prompt_no_escribe_con_guiones_largos():
+    """El modelo imita el estilo de su prompt: un prompt lleno de "—" le
+    enseña a escribirlos. Solo quedan la regla que los prohíbe y el marcador
+    de documentos que arma app/media.py."""
+    system = build_system_prompt(
+        profile=BusinessProfile(),
+        context=_CONTEXTO_ANUNCIO_Y_CITA,
+        conv=Conversation(id=1, wa_identity="5215550001111", greeted=False),
+    )
+    lineas = [l for l in system.splitlines() if "—" in l]
+    assert len(lineas) == 2
+    assert lineas[0].startswith("- FORMATO WHATSAPP")
+    assert "contenido extraído" in lineas[1]
+
+
+def test_prompt_usa_el_anuncio_sin_citarlo_y_mueve_la_cita_con_reschedule():
+    system = build_system_prompt(
+        profile=BusinessProfile(),
+        context=_CONTEXTO_ANUNCIO_Y_CITA,
+        conv=Conversation(id=1, wa_identity="5215550001111", greeted=False),
+    )
+    linea_anuncio = next(l for l in system.splitlines() if "De consulta a cita" in l)
+    assert "no lo cites" in linea_anuncio
+    linea_cita = next(l for l in system.splitlines() if "YA tiene cita" in l)
+    assert "reschedule_session" in linea_cita
+    assert "cambiarla, handoff" not in linea_cita
+
+
+def test_handoff_sin_promesa_no_pisa_la_regla_de_hostilidad():
+    """La regla de "no prometas cuándo escribe una persona" aplica a todo
+    handoff menos al de hostilidad, que cierra sin anunciar nada."""
+    linea = next(
+        l for l in _chassis(BusinessProfile()).splitlines()
+        if l.startswith("Al pasar a humano")
+    )
+    assert "salvo por hostilidad" in linea
+    assert "agendada" not in linea
 
 
 def test_prompt_minimo_advierte_falta_de_conocimiento():

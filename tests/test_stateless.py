@@ -407,6 +407,34 @@ async def test_strip_leaked_marker_texto_normal_con_comillas_no_se_toca():
     assert stateless._strip_leaked_marker(texto) == texto
 
 
+async def test_v2_negrita_markdown_sale_como_negrita_de_whatsapp(respx_mock):
+    """En producción el modelo mandó `**Martes 29 de septiembre, 10:00 am**`:
+    en WhatsApp llega con los asteriscos a la vista."""
+    ctx = make_ctx()
+    ctx.llm.replies = [LlmReply(content="¡Listo! **Martes 29, 10:00 am**. Te llega el **link**.")]
+    routes = mock_crm_basics(respx_mock, conv_id="cv_v2_md_bold")
+    payload = v2_payload(conversation_id="cv_v2_md_bold")
+    await stateless.run_turn(ctx, payload, organization_id="org_a")
+    sent = json.loads(routes["messages"].calls[0].request.content)
+    assert sent["text"] == "¡Listo! *Martes 29, 10:00 am*. Te llega el *link*."
+
+
+async def test_whatsapp_format_casos_borde():
+    casos = [
+        # un `**` huérfano no se empareja con el de la línea siguiente
+        (
+            "Precio **desde $50\n\n¿Te agendo **el martes**?",
+            "Precio **desde $50\n\n¿Te agendo *el martes*?",
+        ),
+        ("***hola***", "*hola*"),
+        ("** hola **", "** hola **"),  # WhatsApp no la pondría en negrita igual
+        ("sin formato", "sin formato"),
+        ("*ya es de WhatsApp*", "*ya es de WhatsApp*"),
+    ]
+    for original, esperado in casos:
+        assert stateless._whatsapp_format(original) == esperado
+
+
 async def test_v2_respuesta_que_es_solo_el_marcador_se_trata_como_agotado(respx_mock):
     """Revisión ronda 3: si tras quitar el marcador no queda NADA, no debe
     volverse un 200 silencioso sin que nadie se entere — se trata como el
