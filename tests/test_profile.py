@@ -12,7 +12,7 @@ from app.profile import (
     profile_from_payload,
     resolve_profile,
 )
-from app.prompt import build_system_prompt
+from app.prompt import _chassis, build_system_prompt
 from app.state import Conversation
 
 
@@ -129,6 +129,16 @@ def test_prompt_compone_chasis_y_negocio():
     assert "route_out" in system
     assert "hostilidad" in system  # el chasis conserva la regla de 3 strikes
     assert "OJO: el negocio aún no configuró" not in system
+
+
+def test_chasis_no_escribe_con_guiones_largos():
+    """El modelo imita el estilo de su prompt: un chasis lleno de "—" le
+    enseña a escribirlos. Solo quedan la regla que los prohíbe y el marcador
+    de documentos que arma app/media.py."""
+    lineas = [l for l in _chassis(BusinessProfile()).splitlines() if "—" in l]
+    assert len(lineas) == 2
+    assert lineas[0].startswith("- FORMATO WHATSAPP")
+    assert "contenido extraído" in lineas[1]
 
 
 def test_prompt_minimo_advierte_falta_de_conocimiento():
