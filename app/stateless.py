@@ -440,7 +440,9 @@ def _strip_leaked_marker(text: str) -> str:
     return _LEAKED_MARKER_RE.sub("", text.lstrip(), count=1)
 
 
-_MD_BOLD_RE = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
+# Sin DOTALL: la negrita de WhatsApp nunca cruza un salto de línea, y un `**`
+# huérfano no debe emparejarse con el de la línea siguiente.
+_MD_BOLD_RE = re.compile(r"\*{2,3}(\S(?:[^\n]*?\S)?)\*{2,3}")
 
 
 def _whatsapp_format(text: str) -> str:

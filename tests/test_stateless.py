@@ -419,6 +419,22 @@ async def test_v2_negrita_markdown_sale_como_negrita_de_whatsapp(respx_mock):
     assert sent["text"] == "¡Listo! *Martes 29, 10:00 am*. Te llega el *link*."
 
 
+async def test_whatsapp_format_casos_borde():
+    casos = [
+        # un `**` huérfano no se empareja con el de la línea siguiente
+        (
+            "Precio **desde $50\n\n¿Te agendo **el martes**?",
+            "Precio **desde $50\n\n¿Te agendo *el martes*?",
+        ),
+        ("***hola***", "*hola*"),
+        ("** hola **", "** hola **"),  # WhatsApp no la pondría en negrita igual
+        ("sin formato", "sin formato"),
+        ("*ya es de WhatsApp*", "*ya es de WhatsApp*"),
+    ]
+    for original, esperado in casos:
+        assert stateless._whatsapp_format(original) == esperado
+
+
 async def test_v2_respuesta_que_es_solo_el_marcador_se_trata_como_agotado(respx_mock):
     """Revisión ronda 3: si tras quitar el marcador no queda NADA, no debe
     volverse un 200 silencioso sin que nadie se entere — se trata como el
