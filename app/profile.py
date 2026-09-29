@@ -52,6 +52,11 @@ class BusinessProfile:
     #: Es la MISMA con la que el motor de agenda etiqueta los huecos. `None`
     #: significa "el CRM no la dijo" y manda entonces AGENT_TIMEZONE.
     timezone: str | None = None
+    #: "inmobiliario" para organizaciones del vertical de bienes raíces (Rei
+    #: CRM, ver app/verticals/inmobiliario/) — chasis y tools propios en vez
+    #: de los de agendamiento B2B de allok. None/ausente (default): TODO el
+    #: comportamiento sigue siendo el de siempre, sin excepción.
+    vertical: str | None = None
 
     @property
     def has_knowledge(self) -> bool:
@@ -75,6 +80,13 @@ def profile_from_payload(payload: dict[str, Any], default_name: str) -> Business
         for item in prof.get("activationMessages") or []
         if str(item).strip()
     )
+    # `payload.vertical`: mismo nivel que `kb`/`resources` (el cuerpo ENTERO
+    # de GET /api/bot/profile, no el objeto anidado `profile`), simétrico a
+    # como `context.realty` cuelga del cuerpo de GET /api/bot/context. Se
+    # tolera también dentro del objeto anidado por si el CRM termina
+    # poniéndolo ahí — ver el reporte del builder para la duda de contrato.
+    vertical_raw = payload.get("vertical") or prof.get("vertical")
+    vertical = str(vertical_raw).strip().lower() if vertical_raw else None
     return BusinessProfile(
         agent_name=str(prof.get("name") or default_name),
         tone=prof.get("tone") or None,
@@ -88,6 +100,7 @@ def profile_from_payload(payload: dict[str, Any], default_name: str) -> Business
         timezone=(str(prof.get("timezone")).strip() or None)
         if prof.get("timezone")
         else None,
+        vertical=vertical or None,
     )
 
 

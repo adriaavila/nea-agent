@@ -63,6 +63,44 @@ class SlotTaken(CrmConflict):
         self.slots: list[dict[str, Any]] = list((payload or {}).get("slots") or [])
 
 
+# --- Vertical inmobiliario (Rei CRM) -----------------------------------------
+#
+# Ver app/verticals/inmobiliario/ para el chasis y las tools que usan estos
+# errores. Cualquier ruta `/api/bot/realty/*` (y `bookings`/`availability` con
+# un `propertyId` inválido) puede darlos; viven aquí y no en el paquete del
+# vertical porque son forma del CONTRATO con el CRM, igual que
+# AgendaUnavailable/SlotTaken arriba.
+
+
+class RealtyVerticalDisabled(CrmError):
+    """404 `vertical_disabled`: la organización no tiene el vertical
+    inmobiliario activo. Cualquier ruta `/api/bot/realty/*` lo devuelve para
+    una organización que no sea de bienes raíces."""
+
+
+class RealtyPropertyNotFound(CrmError):
+    """La propiedad no existe: 404 `property_not_found` (ficha/detalle) o 422
+    `property_not_found` (bookings/availability con un `propertyId` inválido)."""
+
+
+class RealtyPropertyUnavailable(CrmError):
+    """422 `property_unavailable`: la propiedad existe pero ya no se puede
+    ofrecer ni enviar (vendida, pausada, etc.)."""
+
+
+class RealtyInvalidRequirement(CrmError):
+    """422 `invalid_requirement` de `PUT /api/bot/realty/requirement`: un
+    valor no está en el catálogo cerrado (`src/lib/realty/catalog.ts` del
+    CRM — operation/kind/currency/amenities/paymentMethod/urgency). Trae el
+    campo señalado (sobre PLANO `{error, field}`, no el `{error:{code}}`
+    anidado de los demás 409/422 de aquí) para que el modelo lo corrija sin
+    adivinar cuál."""
+
+    def __init__(self, field: str | None = None) -> None:
+        super().__init__(f"invalid_requirement: {field}")
+        self.field = field
+
+
 def _conflict_code(response: httpx.Response) -> str:
     """
     El código del 409, venga en el sobre plano o en el anidado.
@@ -279,17 +317,18 @@ class CrmClient:
         }
 
     async def create_booking(
-        self, conversation_id: str, start_utc: str
+        self, conversation_id: str, start_utc: str, *, property_id: str | None = None
     ) -> dict[str, Any]:
-        resp = await self._request(
-            "POST",
-            "/api/bot/bookings",
-            json={"conversationId": conversation_id, "startUtc": start_utc},
-        )
+        body: dict[str, Any] = {"conversationId": conversation_id, "startUtc": start_utc}
+        if property_id is not None:
+            # Vertical inmobiliario: la visita es a ESTA propiedad. Ausente
+            # (default) el cuerpo queda IDÉNTICO al de siempre (allok/B2B).
+            body["propertyId"] = property_id
+        resp = await self._request("POST", "/api/bot/bookings", json=body)
         return self._booking_response(resp)
 
     async def reschedule_booking(
-        self, conversation_id: str, start_utc: str
+        self, conversation_id: str, start_utc: str, *, property_id: str | None = None
     ) -> dict[str, Any]:
         """
         Mueve la cita viva de esta conversación a otro horario ofrecido.
@@ -297,11 +336,10 @@ class CrmClient:
         PATCH y 200, no POST y 201: mover no crea nada. Los mismos 409 que
         crear, así que comparte el manejo.
         """
-        resp = await self._request(
-            "PATCH",
-            "/api/bot/bookings",
-            json={"conversationId": conversation_id, "startUtc": start_utc},
-        )
+        body: dict[str, Any] = {"conversationId": conversation_id, "startUtc": start_utc}
+        if property_id is not None:
+            body["propertyId"] = property_id
+        resp = await self._request("PATCH", "/api/bot/bookings", json=body)
         return self._booking_response(resp)
 
     @staticmethod
@@ -321,9 +359,104 @@ class CrmClient:
             if code in ("slot_taken", "slot_not_offered"):
                 raise SlotTaken(payload, code=code)
             raise CrmConflict(code, payload)
+        if resp.status_code == 422:
+            # Vertical inmobiliario: `propertyId` inválido en la reserva. Un
+            # 422 fuera de ese caso (nunca lo manda el contrato de siempre)
+            # sigue siendo un CrmError genérico.
+            code = _conflict_code(resp)
+            if code == "property_not_found":
+                raise RealtyPropertyNotFound(code)
+            raise CrmError(f"bookings devolvió 422 ({code})")
         # El CRM real responde 201 Created (REST); los mocks viejos daban 200.
         if resp.status_code not in (200, 201):
             raise CrmError(f"bookings devolvió {resp.status_code}")
+        data: dict[str, Any] = resp.json()
+        return data
+
+    # --- Vertical inmobiliario (Rei CRM) -------------------------------------
+
+    async def get_realty_property(self, property_id: str) -> dict[str, Any]:
+        """Detalle completo de una propiedad (tool `ver_propiedad`, ver
+        app/verticals/inmobiliario/tools.py)."""
+        resp = await self._request(
+            "GET", "/api/bot/realty/property", params={"id": property_id}
+        )
+        if resp.status_code == 404:
+            code = _conflict_code(resp)
+            if code == "vertical_disabled":
+                raise RealtyVerticalDisabled(code)
+            raise RealtyPropertyNotFound(code or "property_not_found")
+        if resp.status_code != 200:
+            raise CrmError(f"realty/property devolvió {resp.status_code}")
+        data: dict[str, Any] = resp.json()
+        return data
+
+    async def put_realty_requirement(
+        self, conversation_id: str, requirement: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Guarda (merge parcial) lo que el comprador/arrendatario busca y
+        regresa `{requirement, candidates}` ya frescos (tool
+        `guardar_requerimiento`)."""
+        resp = await self._request(
+            "PUT",
+            "/api/bot/realty/requirement",
+            json={"conversationId": conversation_id, "requirement": requirement},
+        )
+        if resp.status_code == 404:
+            raise RealtyVerticalDisabled(_conflict_code(resp) or "vertical_disabled")
+        if resp.status_code == 422:
+            # Sobre PLANO `{error: "invalid_requirement", field}` — a
+            # propósito distinto del `{error: {code}}` anidado de los demás
+            # 409/422 de este archivo (ver RealtyInvalidRequirement).
+            payload: dict[str, Any] = {}
+            try:
+                payload = resp.json()
+            except Exception:
+                pass
+            raise RealtyInvalidRequirement(
+                payload.get("field") if isinstance(payload, dict) else None
+            )
+        if resp.status_code != 200:
+            raise CrmError(f"realty/requirement devolvió {resp.status_code}")
+        data: dict[str, Any] = resp.json()
+        return data
+
+    async def post_realty_ficha(
+        self,
+        conversation_id: str,
+        property_id: str,
+        *,
+        dispatch_id: str,
+    ) -> dict[str, Any]:
+        """Manda la ficha (foto + datos) de una propiedad — un SEND más,
+        idempotente por (dispatchId, propertyId) del lado del CRM (tool
+        `enviar_ficha`). A diferencia de `send_message`, NO lleva `seq`: el
+        vertical inmobiliario memoiza por `property_id` DENTRO del turno
+        (ver app/verticals/inmobiliario/tools.py), y un RETRY del despacho
+        completo repite el MISMO `dispatchId` — el CRM dedupea por el par
+        (dispatchId, propertyId), nunca por un contador de Nea."""
+        resp = await self._request(
+            "POST",
+            "/api/bot/realty/ficha",
+            json={
+                "conversationId": conversation_id,
+                "propertyId": property_id,
+                "dispatchId": dispatch_id,
+            },
+        )
+        if resp.status_code == 409:
+            raise CrmConflict(_conflict_code(resp))
+        if resp.status_code == 402:
+            raise CrmPaymentRequired(_conflict_code(resp))
+        if resp.status_code == 404:
+            code = _conflict_code(resp)
+            if code == "vertical_disabled":
+                raise RealtyVerticalDisabled(code)
+            raise RealtyPropertyNotFound(code or "property_not_found")
+        if resp.status_code == 422:
+            raise RealtyPropertyUnavailable(_conflict_code(resp) or "property_unavailable")
+        if resp.status_code != 200:
+            raise CrmError(f"realty/ficha devolvió {resp.status_code}")
         data: dict[str, Any] = resp.json()
         return data
 

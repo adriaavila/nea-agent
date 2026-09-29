@@ -23,7 +23,7 @@ import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 from pydantic import BaseModel, Field, SecretStr, field_validator
 
@@ -38,6 +38,7 @@ from app.prompt import TEAM_OWNER_MARKER_PREFIX, TEAM_OWNER_NOTE, build_system_p
 from app.state import AppContext, Conversation, InboundMessage, OfferedSlot, TurnCommit
 from app.tools import TOOL_SCHEMAS, AlreadyBooked, MemoryOfferBook, ToolRuntime
 from app.turn import _agent_tz
+from app.verticals import inmobiliario
 
 logger = logging.getLogger("nea.stateless")
 
@@ -550,6 +551,8 @@ async def _tool_loop(
     org_llm: Llm | None,
     platform_llm: Llm,
     state: _LlmState,
+    *,
+    tools: list[dict[str, Any]] = TOOL_SCHEMAS,
 ) -> str | None:
     """Rondas de tool-calling hasta obtener texto final (o rendirse) — igual
     que app/turn.py._tool_loop, más el fallback de clave por negocio: si el
@@ -558,13 +561,18 @@ async def _tool_loop(
     (`active` es local a este loop: las rondas siguientes ya no vuelven a
     intentar la del negocio).
 
+    `tools`: el esquema a anunciar (default TOOL_SCHEMAS, allok/B2B). El
+    vertical inmobiliario (`app/verticals/inmobiliario/`) pasa el suyo —
+    `run_turn` es el único llamador y decide cuál, esta función no conoce
+    verticales.
+
     Nota: `state.source` NUNCA se toca aquí — se fija una sola vez al armar
     `state` (ver `run_turn`) y representa de quién es la clave reportada, no
     quién contestó (ver `V2Result`)."""
     active = org_llm or platform_llm
     for _ in range(MAX_TOOL_ROUNDS):
         try:
-            reply = await active.complete(messages, tools=TOOL_SCHEMAS)
+            reply = await active.complete(messages, tools=tools)
         except (LlmAuthFailed, LlmNoCredits) as exc:
             status = "auth_failed" if isinstance(exc, LlmAuthFailed) else "no_credits"
             if active is platform_llm:
@@ -587,7 +595,7 @@ async def _tool_loop(
             )
             active = platform_llm
             try:
-                reply = await active.complete(messages, tools=TOOL_SCHEMAS)
+                reply = await active.complete(messages, tools=tools)
             except (LlmAuthFailed, LlmNoCredits) as exc2:
                 raise LlmExhausted(str(exc2)) from exc2
         if not reply.tool_calls:
@@ -707,6 +715,24 @@ async def _run_reset(
 # ------------------------------------------------------------------ turno ---
 
 
+def select_vertical(
+    profile: BusinessProfile,
+) -> tuple[Callable[..., str], list[dict[str, Any]]]:
+    """El ÚNICO punto de decisión de vertical: qué chasis construir y qué
+    esquema de tools anunciar, según `profile.vertical`. Sin ese campo
+    (default, allok/B2B): el chasis y el esquema de siempre, sin excepción.
+
+    Un solo llamador hoy (`run_turn`, abajo). Cuando `feat/followup-dispatch`
+    mezcle su `_run_followup` — que hoy llama `build_system_prompt` fijo —,
+    ese cambio es una línea: `prompt_builder, _ = select_vertical(profile)` y
+    usar `prompt_builder` en vez de `build_system_prompt` (un followup nunca
+    llama tools, así que el segundo elemento de la tupla no le hace falta
+    ahí). Ver README.md → "Vertical inmobiliario" para la nota completa."""
+    if profile.vertical == inmobiliario.VERTICAL_NAME:
+        return inmobiliario.build_prompt, inmobiliario.REALTY_TOOL_SCHEMAS
+    return build_system_prompt, TOOL_SCHEMAS
+
+
 async def run_turn(
     ctx: AppContext,
     payload: DispatchPayloadV2,
@@ -743,6 +769,11 @@ async def run_turn(
         )
 
     profile = profile_from_payload(payload.profile or {}, default_name=ctx.settings.agent_name)
+    # Único punto de decisión del vertical: TODO lo demás (chasis, esquema de
+    # tools, extra_tools/disabled_tools de ToolRuntime) rama sobre esto. Sin
+    # `profile.vertical` (default, allok/B2B) es exactamente el camino de
+    # siempre — ver app/verticals/inmobiliario/.
+    is_realty = profile.vertical == inmobiliario.VERTICAL_NAME
 
     if not conv_info.get("aiEnabled", False):
         pending_text = "\n".join(m.text for m in pending if m.text)
@@ -796,7 +827,8 @@ async def run_turn(
         wa_identity=identity or conversation_id,
         greeted=bool(conv_info.get("agentHasSpoken")),
     )
-    system = build_system_prompt(
+    prompt_builder, tool_schemas = select_vertical(profile)
+    system = prompt_builder(
         profile=profile,
         context=context,
         conv=fake_conv,
@@ -832,6 +864,20 @@ async def run_turn(
         commit=None,
         offers=offer_book,
         already_booked=_already_booked_from_context(context),
+        extra_tools=(
+            inmobiliario.build_realty_tools(
+                crm=scoped_crm,
+                conversation_id=conversation_id,
+                dispatch_id=payload.dispatchId,
+            )
+            if is_realty
+            else None
+        ),
+        disabled_tools=inmobiliario.DISABLED_TOOLS if is_realty else None,
+        # Barrera de VERDAD para property_id en book_session/reschedule_session
+        # (ver app/tools.py._book_session): el camino allok/B2B nunca lo
+        # reenvía al CRM, ni siquiera si un modelo lo alucinara.
+        allow_property_id=is_realty,
     )
     org_llm = _build_org_llm(payload.llm) if payload.llm is not None else None
     # `source` se fija UNA vez aquí y no cambia — ver el docstring de
@@ -842,7 +888,9 @@ async def run_turn(
     )
     try:
         try:
-            final_text = await _tool_loop(messages, runtime, org_llm, ctx.llm, state)
+            final_text = await _tool_loop(
+                messages, runtime, org_llm, ctx.llm, state, tools=tool_schemas
+            )
         except LlmExhausted as exc:
             logger.error(
                 "stateless %s: LLM agotó reintentos (%s) — silencio + handoff error",
