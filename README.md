@@ -146,6 +146,57 @@ Consecuencias prácticas al integrar:
 El contrato está clavado en `tests/test_agenda_contrato.py`: si Vocero lo
 cambia, ahí se rompe primero.
 
+## Vertical inmobiliario
+
+Un segundo despliegue (Rei CRM, agencias inmobiliarias en LATAM, Bolivia
+primero) corre esta MISMA Nea apuntando a su propio CRM. Se activa por
+organización, no por variable de entorno: cuando `GET /api/bot/profile`
+manda `vertical: "inmobiliario"`, `app/stateless.run_turn` cambia el chasis y
+el set de herramientas (`app/verticals/inmobiliario/`); sin ese campo, TODO
+sigue siendo exactamente el agendamiento B2B de siempre (`app/prompt.py`,
+`app/tools.py`) — el código de allok no sabe que este vertical existe.
+
+Herramientas de este vertical: `guardar_requerimiento` (operación, zona,
+presupuesto, recámaras, forma de pago...), `ver_propiedad(propertyId)`,
+`enviar_ficha(propertyId)` (manda foto + datos; es un SEND idempotente por
+`dispatchId`+`seq`, igual que un mensaje de texto), `propose_slots` /
+`book_session` / `reschedule_session` (las de siempre, con `propertyId`
+opcional para una visita) y `handoff` (además de sus razones de siempre:
+cancelar una visita, negociar precio, hacer una oferta, dudas legales). NO
+existen `update_ficha` (campos B2B de allok) ni `route_out`.
+
+Contrato con el CRM (fijo, ver `app/crm.py` y `app/verticals/inmobiliario/`):
+
+| | |
+|---|---|
+| `profile.vertical` | `"inmobiliario"` activa el vertical; ausente/null = default |
+| `context.realty` | `{requirement, candidates (≤5), focusPropertyId, viewings}` — el chasis SOLO puede mencionar estas candidatas o lo que una tool devuelva, nunca inventa una propiedad |
+| `PUT /api/bot/realty/requirement` | `{conversationId, requirement}` (parcial) → `{requirement, candidates}` |
+| `GET /api/bot/realty/property?id=` | detalle completo de una propiedad |
+| `POST /api/bot/realty/ficha` | `{conversationId, propertyId, dispatchId, seq}` → `{sent, messageId, photoSent, duplicate?}`; mismos 409 que `/api/bot/messages` + 404/422 de propiedad |
+| `GET /api/bot/availability`, `POST`\|`PATCH /api/bot/bookings` | ahora aceptan `propertyId` opcional; 422 `property_not_found` si es inválido |
+| Cualquier ruta `/api/bot/realty/*` | 404 `vertical_disabled` para una organización que no sea de este vertical — Nea lo absorbe con un mensaje de tool gracioso, nunca revienta el turno |
+
+Despliegue dedicado (una Nea compartida solo para Rei CRM, sin base propia —
+ver `DISPATCH_ONLY` más abajo en Configuración):
+
+```env
+DISPATCH_ONLY=true
+# DATABASE_URL vacío/ausente a propósito: con valor, esto deja de ser el modo
+# de solo-despacho puro (ver la sección de arriba) y monta /webhook también.
+CRM_BASE_URL=https://crm.reiprop.tech
+CRM_BOT_API_KEY=REEMPLAZA_api_key_de_32_bytes
+OPENROUTER_API_TOKEN=REEMPLAZA_token_de_openrouter
+OPENROUTER_MODEL=z-ai/glm-5.3-flash
+```
+
+`VERIFY_TOKEN`, `META_APP_SECRET` y `CRM_WEBHOOK_URL` NO hacen falta: sin
+`DATABASE_URL`, `/webhook` no se monta (esta Nea nunca recibe el webhook de
+Meta directamente, solo `/dispatch` — ver `app/main.py::_dispatch_only_sin_db`)
+y el relay que usa `CRM_WEBHOOK_URL` no arranca. `AGENT_TIMEZONE` es solo el
+último recurso si ni el perfil de la agencia ni el negocio la definen; para
+Bolivia, `America/La_Paz`.
+
 ## Quickstart
 
 Requisitos: Python 3.11+, Postgres propio (no el del CRM), una instancia de

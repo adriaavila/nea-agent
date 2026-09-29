@@ -10,15 +10,20 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Protocol
+from typing import Any, Awaitable, Callable, Protocol
 
-from app.crm import AgendaUnavailable, CrmError, SlotTaken
+from app.crm import AgendaUnavailable, CrmError, RealtyPropertyNotFound, SlotTaken
 from app.profile import BusinessProfile
 from app.state import AppContext, Conversation, OfferedSlot, TurnCommit
 
 logger = logging.getLogger("nea.tools")
 
 MAX_OFFERED = 3
+
+#: Handler de una tool que NO vive en este módulo (hoy: solo el vertical
+#: inmobiliario, ver app/verticals/inmobiliario/tools.py). Recibe los args
+#: crudos del tool-call y regresa el mismo shape `{"ok": ...}` que el resto.
+ExtraToolHandler = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
 
 
 class OfferBook(Protocol):
@@ -260,12 +265,22 @@ class ToolRuntime:
         commit: TurnCommit | None = None,
         offers: OfferBook | None = None,
         already_booked: AlreadyBooked | None = None,
+        extra_tools: dict[str, ExtraToolHandler] | None = None,
+        disabled_tools: frozenset[str] | None = None,
     ) -> None:
         self._ctx = ctx
         self._conv = conv
         self._crm_conv_id = crm_conversation_id
         self._profile = profile or BusinessProfile()
         self._commit = commit
+        # Vertical inmobiliario (ver app/verticals/inmobiliario/tools.py):
+        # tools NUEVAS que este módulo no conoce (`extra_tools`) y tools DE
+        # SIEMPRE que ese vertical no debe poder tocar aunque el modelo
+        # alucine el nombre (`disabled_tools` — update_ficha/route_out no se
+        # anuncian en su esquema, pero esto es la barrera de verdad). Vacíos
+        # por default: cero cambio de comportamiento fuera de ese vertical.
+        self._extra_tools = extra_tools or {}
+        self._disabled_tools = disabled_tools or frozenset()
         # v1/legacy (offers=None, comportamiento de SIEMPRE): respaldado por
         # el Store, requiere un `conv` real. v2 (despacho sin estado) siempre
         # pasa su propio MemoryOfferBook — `conv` puede venir None.
@@ -296,6 +311,9 @@ class ToolRuntime:
         self.proposed = False
 
     async def execute(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
+        if name in self._disabled_tools:
+            logger.warning("tools: %s deshabilitada en este perfil — no se ejecuta", name)
+            return {"ok": False, "error": f"herramienta no disponible: {name}"}
         try:
             if name == "update_ficha":
                 return await self._update_ficha(args)
@@ -309,6 +327,8 @@ class ToolRuntime:
                 return await self._route_out()
             if name == "handoff":
                 return self._handoff(args)
+            if name in self._extra_tools:
+                return await self._extra_tools[name](args)
             logger.warning("tools: herramienta desconocida %r", name)
             return {"ok": False, "error": f"herramienta desconocida: {name}"}
         except CrmError as exc:
@@ -371,6 +391,12 @@ class ToolRuntime:
         los mismos 409. Duplicarlo sería duplicar también los errores.
         """
         wanted = _parse_utc(str(args.get("start_utc") or ""))
+        # Vertical inmobiliario (opcional, ver TOOL_SCHEMAS de
+        # app/verticals/inmobiliario/tools.py): la visita es a ESTA
+        # propiedad. Ausente en el esquema por defecto — el modelo del
+        # chasis de siempre nunca lo manda, así que esto es `None` ahí.
+        property_id_raw = args.get("property_id")
+        property_id = property_id_raw.strip() if isinstance(property_id_raw, str) else None
         offered = await self._offers.get()
         if wanted is None:
             return {
@@ -441,11 +467,11 @@ class ToolRuntime:
         try:
             result = await (
                 self._ctx.crm.reschedule_booking(
-                    self._crm_conv_id, _iso_z(chosen.start_utc)
+                    self._crm_conv_id, _iso_z(chosen.start_utc), property_id=property_id
                 )
                 if mover
                 else self._ctx.crm.create_booking(
-                    self._crm_conv_id, _iso_z(chosen.start_utc)
+                    self._crm_conv_id, _iso_z(chosen.start_utc), property_id=property_id
                 )
             )
         except AgendaUnavailable:
@@ -453,6 +479,12 @@ class ToolRuntime:
                 "ok": False,
                 "error": "sin_agenda",
                 "detalle": "esta instancia no agenda; usa handoff para coordinar directo",
+            }
+        except RealtyPropertyNotFound:
+            return {
+                "ok": False,
+                "error": "property_not_found",
+                "detalle": "esa propiedad ya no está disponible; usa una candidata vigente",
             }
         except SlotTaken as exc:
             # Se ocupó entre oferta y elección, o el CRM no reconoce el
@@ -472,7 +504,10 @@ class ToolRuntime:
             }
         await self._offers.clear()
         self.booked = True
-        if not mover:
+        # "calificado"/"resultado" son vocabulario B2B de allok — el mismo que
+        # deshabilita `update_ficha` (ver __init__). Un vertical sin ese B2B
+        # (inmobiliario) no debe escribirlo tampoco solo porque agendó.
+        if not mover and "update_ficha" not in self._disabled_tools:
             try:
                 await self._ctx.crm.put_ficha(
                     self._crm_conv_id, {"calificado": True, "resultado": "agendo"}
