@@ -88,6 +88,19 @@ class RealtyPropertyUnavailable(CrmError):
     ofrecer ni enviar (vendida, pausada, etc.)."""
 
 
+class RealtyInvalidRequirement(CrmError):
+    """422 `invalid_requirement` de `PUT /api/bot/realty/requirement`: un
+    valor no está en el catálogo cerrado (`src/lib/realty/catalog.ts` del
+    CRM — operation/kind/currency/amenities/paymentMethod/urgency). Trae el
+    campo señalado (sobre PLANO `{error, field}`, no el `{error:{code}}`
+    anidado de los demás 409/422 de aquí) para que el modelo lo corrija sin
+    adivinar cuál."""
+
+    def __init__(self, field: str | None = None) -> None:
+        super().__init__(f"invalid_requirement: {field}")
+        self.field = field
+
+
 def _conflict_code(response: httpx.Response) -> str:
     """
     El código del 409, venga en el sobre plano o en el anidado.
@@ -391,6 +404,18 @@ class CrmClient:
         )
         if resp.status_code == 404:
             raise RealtyVerticalDisabled(_conflict_code(resp) or "vertical_disabled")
+        if resp.status_code == 422:
+            # Sobre PLANO `{error: "invalid_requirement", field}` — a
+            # propósito distinto del `{error: {code}}` anidado de los demás
+            # 409/422 de este archivo (ver RealtyInvalidRequirement).
+            payload: dict[str, Any] = {}
+            try:
+                payload = resp.json()
+            except Exception:
+                pass
+            raise RealtyInvalidRequirement(
+                payload.get("field") if isinstance(payload, dict) else None
+            )
         if resp.status_code != 200:
             raise CrmError(f"realty/requirement devolvió {resp.status_code}")
         data: dict[str, Any] = resp.json()
@@ -402,11 +427,14 @@ class CrmClient:
         property_id: str,
         *,
         dispatch_id: str,
-        seq: int,
     ) -> dict[str, Any]:
         """Manda la ficha (foto + datos) de una propiedad — un SEND más,
-        idempotente por (dispatchId, seq) igual que `send_message` (tool
-        `enviar_ficha`)."""
+        idempotente por (dispatchId, propertyId) del lado del CRM (tool
+        `enviar_ficha`). A diferencia de `send_message`, NO lleva `seq`: el
+        vertical inmobiliario memoiza por `property_id` DENTRO del turno
+        (ver app/verticals/inmobiliario/tools.py), y un RETRY del despacho
+        completo repite el MISMO `dispatchId` — el CRM dedupea por el par
+        (dispatchId, propertyId), nunca por un contador de Nea."""
         resp = await self._request(
             "POST",
             "/api/bot/realty/ficha",
@@ -414,7 +442,6 @@ class CrmClient:
                 "conversationId": conversation_id,
                 "propertyId": property_id,
                 "dispatchId": dispatch_id,
-                "seq": seq,
             },
         )
         if resp.status_code == 409:

@@ -267,6 +267,7 @@ class ToolRuntime:
         already_booked: AlreadyBooked | None = None,
         extra_tools: dict[str, ExtraToolHandler] | None = None,
         disabled_tools: frozenset[str] | None = None,
+        allow_property_id: bool = False,
     ) -> None:
         self._ctx = ctx
         self._conv = conv
@@ -281,6 +282,11 @@ class ToolRuntime:
         # por default: cero cambio de comportamiento fuera de ese vertical.
         self._extra_tools = extra_tools or {}
         self._disabled_tools = disabled_tools or frozenset()
+        # `False` por default: el camino allok/B2B de siempre NUNCA reenvía
+        # `property_id` al CRM, ni siquiera si un modelo lo alucinara pese a
+        # no estar en su esquema — la barrera es este flag, no solo "el
+        # esquema no lo anuncia" (ver `_book_session`).
+        self._allow_property_id = allow_property_id
         # v1/legacy (offers=None, comportamiento de SIEMPRE): respaldado por
         # el Store, requiere un `conv` real. v2 (despacho sin estado) siempre
         # pasa su propio MemoryOfferBook — `conv` puede venir None.
@@ -393,9 +399,11 @@ class ToolRuntime:
         wanted = _parse_utc(str(args.get("start_utc") or ""))
         # Vertical inmobiliario (opcional, ver TOOL_SCHEMAS de
         # app/verticals/inmobiliario/tools.py): la visita es a ESTA
-        # propiedad. Ausente en el esquema por defecto — el modelo del
-        # chasis de siempre nunca lo manda, así que esto es `None` ahí.
-        property_id_raw = args.get("property_id")
+        # propiedad. `self._allow_property_id` es la barrera de VERDAD (no
+        # solo "el esquema por defecto no lo anuncia"): fuera de ese
+        # vertical esto es SIEMPRE `None`, ni siquiera si el modelo lo
+        # alucinara pese a no estar en su esquema.
+        property_id_raw = args.get("property_id") if self._allow_property_id else None
         property_id = property_id_raw.strip() if isinstance(property_id_raw, str) else None
         offered = await self._offers.get()
         if wanted is None:

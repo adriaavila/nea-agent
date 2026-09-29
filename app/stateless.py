@@ -23,7 +23,7 @@ import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 from pydantic import BaseModel, Field, SecretStr, field_validator
 
@@ -715,6 +715,24 @@ async def _run_reset(
 # ------------------------------------------------------------------ turno ---
 
 
+def select_vertical(
+    profile: BusinessProfile,
+) -> tuple[Callable[..., str], list[dict[str, Any]]]:
+    """El ÚNICO punto de decisión de vertical: qué chasis construir y qué
+    esquema de tools anunciar, según `profile.vertical`. Sin ese campo
+    (default, allok/B2B): el chasis y el esquema de siempre, sin excepción.
+
+    Un solo llamador hoy (`run_turn`, abajo). Cuando `feat/followup-dispatch`
+    mezcle su `_run_followup` — que hoy llama `build_system_prompt` fijo —,
+    ese cambio es una línea: `prompt_builder, _ = select_vertical(profile)` y
+    usar `prompt_builder` en vez de `build_system_prompt` (un followup nunca
+    llama tools, así que el segundo elemento de la tupla no le hace falta
+    ahí). Ver README.md → "Vertical inmobiliario" para la nota completa."""
+    if profile.vertical == inmobiliario.VERTICAL_NAME:
+        return inmobiliario.build_prompt, inmobiliario.REALTY_TOOL_SCHEMAS
+    return build_system_prompt, TOOL_SCHEMAS
+
+
 async def run_turn(
     ctx: AppContext,
     payload: DispatchPayloadV2,
@@ -809,7 +827,7 @@ async def run_turn(
         wa_identity=identity or conversation_id,
         greeted=bool(conv_info.get("agentHasSpoken")),
     )
-    prompt_builder = inmobiliario.build_prompt if is_realty else build_system_prompt
+    prompt_builder, tool_schemas = select_vertical(profile)
     system = prompt_builder(
         profile=profile,
         context=context,
@@ -851,14 +869,16 @@ async def run_turn(
                 crm=scoped_crm,
                 conversation_id=conversation_id,
                 dispatch_id=payload.dispatchId,
-                commit=commit,
             )
             if is_realty
             else None
         ),
         disabled_tools=inmobiliario.DISABLED_TOOLS if is_realty else None,
+        # Barrera de VERDAD para property_id en book_session/reschedule_session
+        # (ver app/tools.py._book_session): el camino allok/B2B nunca lo
+        # reenvía al CRM, ni siquiera si un modelo lo alucinara.
+        allow_property_id=is_realty,
     )
-    tool_schemas = inmobiliario.REALTY_TOOL_SCHEMAS if is_realty else TOOL_SCHEMAS
     org_llm = _build_org_llm(payload.llm) if payload.llm is not None else None
     # `source` se fija UNA vez aquí y no cambia — ver el docstring de
     # `_LlmState`/`V2Result` (es de quién es la clave, no quién contestó).

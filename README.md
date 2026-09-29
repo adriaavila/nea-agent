@@ -157,25 +157,44 @@ sigue siendo exactamente el agendamiento B2B de siempre (`app/prompt.py`,
 `app/tools.py`) — el código de allok no sabe que este vertical existe.
 
 Herramientas de este vertical: `guardar_requerimiento` (operación, zona,
-presupuesto, recámaras, forma de pago...), `ver_propiedad(propertyId)`,
-`enviar_ficha(propertyId)` (manda foto + datos; es un SEND idempotente por
-`dispatchId`+`seq`, igual que un mensaje de texto), `propose_slots` /
-`book_session` / `reschedule_session` (las de siempre, con `propertyId`
-opcional para una visita) y `handoff` (además de sus razones de siempre:
-cancelar una visita, negociar precio, hacer una oferta, dudas legales). NO
-existen `update_ficha` (campos B2B de allok) ni `route_out`.
+presupuesto, dormitorios, forma de pago... con los catálogos cerrados de Rei,
+ver abajo), `ver_propiedad(propertyId)`, `enviar_ficha(propertyId)` (manda
+foto + datos; es un SEND, idempotente por `(dispatchId, propertyId)` del
+lado del CRM), `propose_slots` / `book_session` / `reschedule_session` (las
+de siempre, con `propertyId` opcional para una visita) y `handoff` (además
+de sus razones de siempre: cancelar una visita, negociar precio, hacer una
+oferta, dudas legales). NO existen `update_ficha` (campos B2B de allok) ni
+`route_out`; sin conocimiento configurado, el chasis se apoya en
+`ver_propiedad`, nunca escala solo por eso.
+
+Los valores de `guardar_requerimiento` (operation, kind, currency, amenities,
+paymentMethod, urgency) son los catálogos cerrados de
+`src/lib/realty/catalog.ts` (repo `vocero-inmobiliario`), espejados en
+`app/verticals/inmobiliario/catalog.py` y declarados como `enum` en el
+esquema de la tool — el lead puede decir "alquiler", pero el valor que viaja
+es `renta`. Un valor fuera de catálogo lo rechaza el CRM (ver la tabla).
 
 Contrato con el CRM (fijo, ver `app/crm.py` y `app/verticals/inmobiliario/`):
 
 | | |
 |---|---|
 | `profile.vertical` | `"inmobiliario"` activa el vertical; ausente/null = default |
-| `context.realty` | `{requirement, candidates (≤5), focusPropertyId, viewings}` — el chasis SOLO puede mencionar estas candidatas o lo que una tool devuelva, nunca inventa una propiedad |
-| `PUT /api/bot/realty/requirement` | `{conversationId, requirement}` (parcial) → `{requirement, candidates}` |
-| `GET /api/bot/realty/property?id=` | detalle completo de una propiedad |
-| `POST /api/bot/realty/ficha` | `{conversationId, propertyId, dispatchId, seq}` → `{sent, messageId, photoSent, duplicate?}`; mismos 409 que `/api/bot/messages` + 404/422 de propiedad |
-| `GET /api/bot/availability`, `POST`\|`PATCH /api/bot/bookings` | ahora aceptan `propertyId` opcional; 422 `property_not_found` si es inválido |
-| Cualquier ruta `/api/bot/realty/*` | 404 `vertical_disabled` para una organización que no sea de este vertical — Nea lo absorbe con un mensaje de tool gracioso, nunca revienta el turno |
+| `context.realty` | `{requirement, candidates (≤5), focusPropertyId, viewings}`. El chasis SOLO puede mencionar estas candidatas o lo que una tool devuelva, nunca inventa una propiedad; las candidatas NUNCA traen dirección (solo `ver_propiedad` la trae) |
+| `PUT /api/bot/realty/requirement` | `{conversationId, requirement}` (parcial) → `{requirement, candidates}`; 422 `{error: "invalid_requirement", field}` si un valor no está en catálogo (Nea se lo devuelve al modelo para que lo corrija) |
+| `GET /api/bot/realty/property?id=` | detalle completo de una propiedad, incluida su dirección |
+| `POST /api/bot/realty/ficha` | `{conversationId, propertyId, dispatchId}` (SIN `seq`) → `{sent, messageId, photoSent, duplicate?}`; mismos 409 que `/api/bot/messages` + 404/422 de propiedad. Idempotente por `(dispatchId, propertyId)`: Nea memoiza por `property_id` dentro del turno (dos tool-calls a la misma propiedad = un solo POST) y NUNCA marca ningún commit al mandarla (solo el envío del texto final compromete), así que una respuesta de texto fallida después sigue pudiendo forzar un reintento del despacho completo sin duplicar la ficha |
+| `GET /api/bot/availability`, `POST`\|`PATCH /api/bot/bookings` | ahora aceptan `propertyId` opcional (solo en este vertical: el camino allok/B2B nunca lo manda, ni con un modelo que lo alucine); 422 `property_not_found` si es inválido |
+| Cualquier ruta `/api/bot/realty/*` | 404 `vertical_disabled` para una organización que no sea de este vertical. Nea lo absorbe con un mensaje de tool gracioso, nunca revienta el turno |
+
+`app/stateless.select_vertical(profile)` es el ÚNICO punto de decisión (qué
+chasis construir, qué esquema de tools anunciar): hoy solo lo llama
+`run_turn`. Cuando `feat/followup-dispatch` se mezcle, su `_run_followup`
+(que hoy llama `build_system_prompt` fijo, sin vertical) debe cambiar a
+`prompt_builder, _ = select_vertical(profile)` y usar `prompt_builder` en
+vez de `build_system_prompt` — un followup nunca llama tools, así que el
+segundo elemento de la tupla no le hace falta ahí. Sin ese cambio, el ÚNICO
+empujón de seguimiento de una organización inmobiliaria saldría con el
+chasis y el tono de allok en vez del de la agencia.
 
 Despliegue dedicado (una Nea compartida solo para Rei CRM, sin base propia —
 ver `DISPATCH_ONLY` más abajo en Configuración):
