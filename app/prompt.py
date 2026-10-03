@@ -11,6 +11,7 @@ comportamiento end-to-end (ver README, "Definición de Hecho").
 """
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -133,6 +134,22 @@ def _fmt_local(dt: datetime, tz: ZoneInfo) -> str:
     )
 
 
+def stable_prompt(profile: BusinessProfile) -> str:
+    """La parte del system prompt que SOLO depende del negocio: chasis +
+    perfil. Excluye el bloque "CONTEXTO ACTUAL" (fecha/hora, nombre y ficha
+    del lead, horarios ofrecidos, cita agendada), que cambia en cada turno."""
+    return _chassis(profile) + "\n\n" + _business_block(profile)
+
+
+def prompt_version(profile: BusinessProfile) -> str:
+    """Huella (12 hex de sha256) de `stable_prompt`: dos turnos con el mismo
+    chasis y el mismo perfil del negocio comparten versión aunque cambie la
+    hora o el lead; editar el perfil o el chasis la cambia. Va en
+    `decision.promptVersion` para que el dueño vea con qué instrucciones
+    decidió el agente."""
+    return hashlib.sha256(stable_prompt(profile).encode("utf-8")).hexdigest()[:12]
+
+
 def build_system_prompt(
     *,
     profile: BusinessProfile,
@@ -191,13 +208,7 @@ def build_system_prompt(
             "No agendes otra; si quiere cambiarla, handoff."
         )
 
-    return (
-        _chassis(profile)
-        + "\n\n"
-        + _business_block(profile)
-        + "\n"
-        + "\n".join(lines)
-    )
+    return stable_prompt(profile) + "\n" + "\n".join(lines)
 
 
 #: Despacho v2 (app/stateless.py): el historial que manda el CRM incluye las
