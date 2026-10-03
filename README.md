@@ -139,13 +139,16 @@ qué (el CRM que no lo conozca lo ignora):
 ```
 
 - `model`: el que contestó de verdad (tras un fallback del negocio a la
-  plataforma, el de la plataforma). `promptVersion`: 12 hex del sha256 del
-  prompt SIN la parte por turno (hora, lead, horarios ofrecidos): cambia solo
-  si cambia el perfil del negocio o el chasis.
+  plataforma, el de la plataforma). `promptVersion`: 12 hex del sha256 de lo
+  que fija el comportamiento y no cambia por turno (chasis, perfil del
+  negocio, `TOOL_SCHEMAS`, la nota de equipo y la alerta de hostilidad), SIN
+  la parte por turno (hora, lead, horarios ofrecidos).
 - `steps`: las herramientas en orden de llamada (máx. 20), con un resumen en
-  español. Nunca llevan valores de la ficha (solo nombres de campo),
-  teléfonos, correos, enlaces ni claves; un paso fallido trae `ok: false` y
-  una razón corta, sin stack.
+  español de plantillas fijas. De la ficha solo nombres de campo conocidos
+  (cualquier otra clave es "otros campos"), del handoff solo el motivo
+  canónico en una frase fija (nunca el texto libre del modelo), y una
+  herramienta fuera de `TOOL_SCHEMAS` se reporta como `desconocida`. Un paso
+  fallido trae `ok: false` y una razón de un catálogo cerrado, sin stack.
 - `tokens` se omite si el cliente LLM no reporta uso. Turnos que no llegan al
   LLM (noop, silencio previo, reset) no llevan `decision`. v1 no cambia.
 
