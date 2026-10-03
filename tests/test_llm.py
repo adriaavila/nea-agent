@@ -282,3 +282,46 @@ async def test_solo_openai_sin_openrouter_transcribe_con_el_mismo_cliente(respx_
     assert text == "listo"
     assert whisper_route.call_count == 1
     await llm.aclose()
+
+
+# ------------------------------------------------- modelo y uso por respuesta ---
+
+
+async def test_complete_devuelve_el_uso_de_ESA_respuesta(respx_mock):
+    """El rastro de decisión (app/decision.py) suma tokens por respuesta: el
+    cliente de plataforma atiende turnos concurrentes, así que el uso viaja
+    en el `LlmReply` y no como delta de un contador compartido."""
+    respx_mock.post(OPENAI_CHAT).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"role": "assistant", "content": "hola"}}],
+                "usage": {"prompt_tokens": 120, "completion_tokens": 30, "total_tokens": 150},
+            },
+        )
+    )
+    llm = OpenAiLlm("sk-x", "gpt-4o-mini", max_retries=0)
+    reply = await llm.complete(MSGS)
+    assert reply.usage is not None
+    assert (reply.usage.input, reply.usage.output) == (120, 30)
+    # el contador acumulado de siempre (bench de costos 002) sigue igual
+    assert llm.usage["prompt"] == 120 and llm.usage["completion"] == 30
+    await llm.aclose()
+
+
+async def test_complete_sin_uso_del_proveedor_deja_usage_en_none(respx_mock):
+    respx_mock.post(OPENAI_CHAT).mock(
+        return_value=httpx.Response(
+            200, json={"choices": [{"message": {"role": "assistant", "content": "hola"}}]}
+        )
+    )
+    llm = OpenAiLlm("sk-x", "gpt-4o-mini", max_retries=0)
+    reply = await llm.complete(MSGS)
+    assert reply.usage is None
+    await llm.aclose()
+
+
+async def test_model_expone_el_id_configurado():
+    llm = OpenAiLlm("sk-x", "z-ai/glm-5.3-flash", base_url="https://openrouter.ai/api/v1")
+    assert llm.model == "z-ai/glm-5.3-flash"
+    await llm.aclose()
