@@ -22,6 +22,7 @@ idempotentes al arranque · httpx (CRM y OpenAI) · pytest + respx · Docker
 | Webhook/firma/dedup/relay | `app/webhook.py` · `app/relay.py` |
 | Coalesce y seguimiento | `app/coalesce.py` · `app/followup.py` |
 | Despacho multi-organización (Vocero multitenant) | `app/dispatch.py` · `app/multiorg.py` |
+| El rastro de decisión (`decision` en la respuesta v2) | `app/decision.py` (resúmenes sin datos del lead) |
 | Tablas | `migrations/*.sql` (idempotentes, aplican al boot) |
 
 ## Reglas duras
