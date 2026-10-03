@@ -16,8 +16,10 @@ import json
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
+from app.hostility import ALERT as HOSTILITY_ALERT
 from app.profile import BusinessProfile
 from app.state import Conversation, OfferedSlot
+from app.tools import TOOL_SCHEMAS
 
 DEFAULT_TZ = ZoneInfo("America/Mexico_City")
 
@@ -142,12 +144,24 @@ def stable_prompt(profile: BusinessProfile) -> str:
 
 
 def prompt_version(profile: BusinessProfile) -> str:
-    """Huella (12 hex de sha256) de `stable_prompt`: dos turnos con el mismo
-    chasis y el mismo perfil del negocio comparten versión aunque cambie la
-    hora o el lead; editar el perfil o el chasis la cambia. Va en
-    `decision.promptVersion` para que el dueño vea con qué instrucciones
-    decidió el agente."""
-    return hashlib.sha256(stable_prompt(profile).encode("utf-8")).hexdigest()[:12]
+    """Huella (12 hex de sha256) de TODO lo que fija cómo se comporta el
+    agente y no cambia por turno: `stable_prompt` (chasis + perfil del
+    negocio), las herramientas que ve el modelo (`TOOL_SCHEMAS`, con sus
+    descripciones) y los dos avisos de sistema que el despacho v2 añade según
+    el caso (`TEAM_OWNER_NOTE`, `HOSTILITY_ALERT`). Dos turnos con lo mismo
+    comparten versión aunque cambie la hora o el lead; editar el perfil, el
+    chasis, una herramienta o uno de los avisos la cambia. Va en
+    `decision.promptVersion` para que el dueño vea con qué reglas decidió el
+    agente."""
+    material = "\n\x1e".join(
+        (
+            stable_prompt(profile),
+            json.dumps(TOOL_SCHEMAS, sort_keys=True, ensure_ascii=False),
+            TEAM_OWNER_NOTE,
+            HOSTILITY_ALERT,
+        )
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:12]
 
 
 def build_system_prompt(

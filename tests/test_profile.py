@@ -198,3 +198,44 @@ def test_prompt_version_cambia_cuando_cambia_el_perfil_del_negocio(cambio):
 
     prof = profile_from_payload(PAYLOAD, default_name="Nea")
     assert prompt_version(replace(prof, **cambio)) != prompt_version(prof)
+
+
+@pytest.mark.parametrize("pieza", ["TOOL_SCHEMAS", "TEAM_OWNER_NOTE", "HOSTILITY_ALERT"])
+def test_prompt_version_cubre_lo_que_cambia_el_comportamiento_en_codigo(pieza, monkeypatch):
+    """No solo el perfil: las herramientas que ve el modelo (con sus
+    descripciones) y los dos avisos de sistema del despacho v2 también fijan
+    cómo decide el agente, así que editarlos cambia la versión."""
+    import copy
+
+    from app import prompt as prompt_module
+
+    prof = profile_from_payload(PAYLOAD, default_name="Nea")
+    base = prompt_version(prof)
+
+    original = getattr(prompt_module, pieza)
+    if pieza == "TOOL_SCHEMAS":
+        editado = copy.deepcopy(original)
+        editado[0]["function"]["description"] += " Ahora también valida el rol."
+    else:
+        editado = original + " (regla nueva)"
+    monkeypatch.setattr(prompt_module, pieza, editado)
+
+    assert prompt_version(prof) != base
+    monkeypatch.setattr(prompt_module, pieza, original)
+    assert prompt_version(prof) == base  # y volver atrás devuelve la misma versión
+
+
+def test_prompt_version_sigue_estable_con_herramientas_y_avisos_incluidos():
+    """Contraprueba de lo anterior: sumar código a la huella no la vuelve
+    dependiente del contexto del turno."""
+    from datetime import datetime, timezone
+
+    prof = profile_from_payload(PAYLOAD, default_name="Nea")
+    antes = prompt_version(prof)
+    build_system_prompt(
+        profile=prof,
+        context={"contact": {"name": "Ana"}},
+        conv=_conv(),
+        now=datetime(2030, 1, 1, tzinfo=timezone.utc),
+    )
+    assert prompt_version(prof) == antes
