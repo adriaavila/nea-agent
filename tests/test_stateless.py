@@ -9,10 +9,13 @@ Dos niveles, a propósito:
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
 import logging
+import re
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -20,7 +23,7 @@ import pytest
 
 from app import stateless
 from app.crm import CrmClient
-from app.llm import LlmAuthFailed, LlmNoCredits, LlmReply, ToolCall
+from app.llm import LlmAuthFailed, LlmExhausted, LlmNoCredits, LlmReply, LlmUsage, ToolCall
 from app.state import AppContext, NullStore, TurnCommit
 from tests.conftest import CRM_URL, IDENTITY, FakeLLM, make_ctx, mock_crm_basics
 
@@ -1375,3 +1378,467 @@ async def test_v2_payload_con_la_forma_real_del_crm_no_revienta_y_responde(respx
     assert "María López" in final_text and "+528112345678" in final_text
     assert "eso es todo, gracias" in final_text
     assert "None" not in final_text
+
+
+# ======================================================= rastro de decisión ===
+# `decision` en la respuesta de /dispatch (app/decision.py): qué hizo el
+# agente en el turno y con qué. Aditivo y opcional — el CRM que no lo conozca
+# lo ignora (como ya ignora `llm.answeredWith`).
+
+OPENROUTER_CHAT = "https://openrouter.ai/api/v1/chat/completions"
+
+
+def tool_round(*calls: tuple[str, str, dict[str, Any]]) -> LlmReply:
+    """Una respuesta del modelo que SOLO pide herramientas (content vacío)."""
+    return LlmReply(
+        content=None,
+        tool_calls=[ToolCall(id=i, name=n, arguments=a) for i, n, a in calls],
+    )
+
+
+def mock_availability(respx_mock: Any) -> Any:
+    return respx_mock.get(f"{CRM_URL}/api/bot/availability").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "slots": [
+                    {"startUtc": SLOT_ISO, "endUtc": "2026-07-20T16:30:00Z", "label": "lunes 10:00"},
+                    {"startUtc": SLOT2_ISO, "endUtc": "2026-07-21T16:30:00Z", "label": "martes 10:00"},
+                ],
+                "diasConAgenda": ["2026-07-20", "2026-07-21"],
+            },
+        )
+    )
+
+
+class ScriptedLLM(FakeLLM):
+    """Contesta las respuestas en cola y, cuando se acaban, se agota (como un
+    OpenAiLlm que falló todos sus reintentos)."""
+
+    async def complete(self, messages, tools=None):  # type: ignore[override]
+        if not self.replies:
+            raise LlmExhausted("sin más respuestas")
+        return await super().complete(messages, tools)
+
+
+async def test_v2_decision_en_el_sobre_http_con_pasos_modelo_y_tokens(client, ctx, respx_mock):
+    """El camino completo por HTTP: dos rondas de herramientas (en orden de
+    llamada) y un texto final; el sobre trae `decision` con todo el contrato."""
+    ctx.llm.replies = [
+        LlmReply(
+            content=None,
+            tool_calls=[
+                ToolCall(id="t1", name="update_ficha", arguments={"rubro": "dentista", "dolor_principal": "agenda vacía"}),
+                ToolCall(id="t2", name="propose_slots", arguments={}),
+            ],
+            usage=LlmUsage(input=1200, output=40),
+        ),
+        LlmReply(content="Te ofrezco lunes 10:00 o martes 10:00.", usage=LlmUsage(input=1500, output=25)),
+    ]
+    routes = mock_crm_basics(respx_mock, conv_id="cv_v2_decision")
+    mock_availability(respx_mock)
+    body = v2_body(conversation_id="cv_v2_decision")
+    resp = await client.post("/dispatch", content=body, headers={"x-signature": sign(body)})
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+
+    assert data["action"] == "replied"
+    assert routes["messages"].call_count == 1
+    decision = data["decision"]
+    assert set(decision) == {"model", "promptVersion", "steps", "latencyMs", "tokens"}
+    assert decision["model"] == "fake-platform-model"
+    assert re.fullmatch(r"[0-9a-f]{12}", decision["promptVersion"])
+    assert decision["steps"] == [
+        {"tool": "update_ficha", "summary": "actualizó lead: rubro, dolor principal", "ok": True},
+        {"tool": "propose_slots", "summary": "ofreció 2 horarios: lunes 10:00, martes 10:00", "ok": True},
+    ]
+    assert isinstance(decision["latencyMs"], int) and decision["latencyMs"] >= 0
+    assert decision["tokens"] == {"input": 2700, "output": 65}  # suma de las 2 rondas
+
+
+async def test_v2_decision_ejemplo_de_agendar_y_pasar_a_una_persona(respx_mock):
+    ctx = make_ctx()
+    ctx.llm.replies = [
+        tool_round(("t1", "book_session", {"start_utc": SLOT_ISO})),
+        tool_round(("t2", "handoff", {"reason": "pidió humano"})),
+        LlmReply(content="Listo, te agendé. Una persona te escribe."),
+    ]
+    mock_crm_basics(respx_mock, conv_id="cv_v2_decision_book")
+    respx_mock.post(f"{CRM_URL}/api/bot/bookings").mock(
+        return_value=httpx.Response(201, json={"bookingId": "bk_1", "label": "lunes 10:00"})
+    )
+    payload = v2_payload(
+        conversation_id="cv_v2_decision_book",
+        offers=[{"startUtc": SLOT_ISO, "label": "lunes 10:00"}],
+    )
+    result = await stateless.run_turn(ctx, payload, organization_id="org_a")
+    assert result.action == "replied"
+    assert result.decision is not None
+    assert result.decision["steps"] == [
+        {"tool": "book_session", "summary": "agendó: lunes 10:00", "ok": True},
+        {"tool": "handoff", "summary": "pasó a una persona: pidió humano", "ok": True},
+    ]
+
+
+async def test_v2_decision_marca_ok_false_en_un_paso_fallido_y_el_turno_sigue(respx_mock):
+    ctx = make_ctx()
+    ctx.llm.replies = [
+        tool_round(
+            ("t1", "book_session", {"start_utc": SLOT_ISO}),  # nunca se ofreció
+            ("t2", "update_ficha", {"rubro": "spa"}),  # el CRM responde 500
+        ),
+        LlmReply(content="Déjame ofrecerte otros horarios."),
+    ]
+    routes = mock_crm_basics(respx_mock, conv_id="cv_v2_decision_fail")
+    respx_mock.put(f"{CRM_URL}/api/bot/ficha").mock(return_value=httpx.Response(500))
+    payload = v2_payload(conversation_id="cv_v2_decision_fail")
+    result = await stateless.run_turn(ctx, payload, organization_id="org_a")
+    assert result.action == "replied"
+    assert routes["messages"].call_count == 1
+    assert result.decision is not None
+    assert result.decision["steps"] == [
+        {
+            "tool": "book_session",
+            "summary": "intentó agendar (falló: ese horario no se había ofrecido)",
+            "ok": False,
+        },
+        {
+            "tool": "update_ficha",
+            "summary": "intentó actualizar lead: rubro (falló: el CRM no respondió)",
+            "ok": False,
+        },
+    ]
+
+
+async def test_v2_decision_resumenes_nunca_filtran_valores_ni_secretos(client, ctx, respx_mock):
+    """Los resúmenes salen para una pantalla del negocio: de la ficha solo
+    nombres de campo; ni el teléfono del lead, ni la clave del negocio, ni el
+    cuerpo de los mensajes aparecen en `decision`."""
+    secreto = "sk-negocio-que-jamas-debe-salir-1234567890"
+    mensaje_lead = "mi correo es dueno@clinica.com y mi cel 0414-9998877"
+    respx_mock.post(OPENROUTER_CHAT).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"role": "assistant", "content": "Anotado, gracias."}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 3},
+            },
+        )
+    )
+    mock_crm_basics(respx_mock, conv_id="cv_v2_decision_redact")
+    body = v2_body(
+        conversation_id="cv_v2_decision_redact",
+        history=[hist("lead", mensaje_lead, pending=True)],
+        llm={"provider": "openrouter", "model": "z-ai/glm-5.3-flash", "apiKey": secreto},
+    )
+    resp = await client.post("/dispatch", content=body, headers={"x-signature": sign(body)})
+    assert resp.status_code == 200, resp.text
+    decision_json = json.dumps(resp.json()["decision"], ensure_ascii=False)
+    for fuga in (secreto, "dueno@clinica.com", "9998877", IDENTITY, "Anotado, gracias"):
+        assert fuga not in decision_json
+
+    # y con herramientas que cargan datos del lead:
+    ctx.llm.replies = [
+        tool_round(
+            (
+                "t1",
+                "update_ficha",
+                {
+                    "rubro": "clínica dental",
+                    "notas": mensaje_lead,
+                    "geo": "Valencia, Carabobo",
+                },
+            ),
+            ("t2", "handoff", {"reason": f"pidió llamada al {IDENTITY} o a dueno@clinica.com"}),
+        ),
+        LlmReply(content="Listo."),
+    ]
+    body2 = v2_body(conversation_id="cv_v2_decision_redact", dispatch_id="dsp_2")
+    resp2 = await client.post("/dispatch", content=body2, headers={"x-signature": sign(body2)})
+    decision_json2 = json.dumps(resp2.json()["decision"], ensure_ascii=False)
+    assert "actualizó lead: rubro, notas, zona" in decision_json2
+    for fuga in ("clínica dental", "9998877", "dueno@clinica.com", IDENTITY, "Valencia", "Carabobo"):
+        assert fuga not in decision_json2
+
+
+async def test_v2_prompt_version_estable_entre_turnos_con_distinta_hora(respx_mock, monkeypatch):
+    """`promptVersion` es la huella de la parte ESTABLE del prompt (chasis +
+    perfil): la hora actual —y el resto del contexto del turno— cambia el
+    prompt completo pero no la versión."""
+    from app import prompt as prompt_module
+
+    class Reloj(datetime):
+        ahora = datetime(2026, 10, 1, 9, 0, tzinfo=timezone.utc)
+
+        @classmethod
+        def now(cls, tz=None):  # type: ignore[override]
+            return cls.ahora
+
+    monkeypatch.setattr(prompt_module, "datetime", Reloj)
+
+    mock_crm_basics(respx_mock, conv_id="cv_v2_pv_hora")
+    ctx = make_ctx()
+    payload = v2_payload(conversation_id="cv_v2_pv_hora")
+    primero = await stateless.run_turn(ctx, payload, organization_id="org_a")
+    Reloj.ahora = datetime(2026, 10, 3, 22, 45, tzinfo=timezone.utc)
+    segundo = await stateless.run_turn(ctx, payload, organization_id="org_a")
+
+    prompts = [c["messages"][0]["content"] for c in ctx.llm.calls]
+    assert prompts[0] != prompts[1]  # la hora SÍ cambió el prompt completo
+    assert "1 de octubre de 2026" in prompts[0]
+    assert "3 de octubre de 2026" in prompts[1]
+    assert primero.decision is not None and segundo.decision is not None
+    assert primero.decision["promptVersion"] == segundo.decision["promptVersion"]
+
+
+async def test_v2_prompt_version_cambia_cuando_cambia_el_perfil_del_negocio(respx_mock):
+    mock_crm_basics(respx_mock, conv_id="cv_v2_pv_perfil")
+    ctx = make_ctx()
+    base = v2_payload(conversation_id="cv_v2_pv_perfil")
+    editado = v2_payload(conversation_id="cv_v2_pv_perfil")
+    editado.profile["profile"]["instructions"] = "Vendemos blanqueamientos; precio desde $90."
+    editado_kb = v2_payload(conversation_id="cv_v2_pv_perfil")
+    editado_kb.profile["kb"] = "P: ¿Horario? R: Lunes a viernes de 9 a 5."
+
+    versions = []
+    for payload in (base, base, editado, editado_kb):
+        result = await stateless.run_turn(ctx, payload, organization_id="org_a")
+        assert result.decision is not None
+        versions.append(result.decision["promptVersion"])
+
+    assert versions[0] == versions[1]  # mismo perfil → misma versión
+    assert len({versions[0], versions[2], versions[3]}) == 3  # cada edición, una nueva
+
+
+async def test_v2_decision_con_llm_agotado_trae_los_pasos_hasta_ahi(client, ctx, respx_mock):
+    """`LlmExhausted` → silencio + handoff `error`: el sobre sigue trayendo
+    `decision`, con lo que alcanzó a hacer antes de agotarse."""
+    ctx.llm = ScriptedLLM(
+        [
+            LlmReply(
+                content=None,
+                tool_calls=[ToolCall(id="t1", name="update_ficha", arguments={"rubro": "gimnasio"})],
+                usage=LlmUsage(input=900, output=12),
+            )
+        ]
+    )
+    routes = mock_crm_basics(respx_mock, conv_id="cv_v2_decision_exhausted")
+    body = v2_body(conversation_id="cv_v2_decision_exhausted")
+    resp = await client.post("/dispatch", content=body, headers={"x-signature": sign(body)})
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+
+    assert data["action"] == "silent"
+    assert data["handoff"] == {"reason": "error", "applied": True}
+    assert routes["messages"].call_count == 0
+    decision = data["decision"]
+    assert decision["model"] == "fake-platform-model"
+    assert decision["steps"] == [
+        {"tool": "update_ficha", "summary": "actualizó lead: rubro", "ok": True}
+    ]
+    assert decision["tokens"] == {"input": 900, "output": 12}
+    assert re.fullmatch(r"[0-9a-f]{12}", decision["promptVersion"])
+
+
+async def test_v2_decision_con_ambas_claves_rotas_reporta_el_modelo_de_la_plataforma(respx_mock):
+    ctx = make_ctx()
+    ctx.llm.raise_exc = LlmAuthFailed("la plataforma también falló")
+    mock_crm_basics(respx_mock, conv_id="cv_v2_decision_ambas")
+    respx_mock.post(OPENROUTER_CHAT).mock(
+        return_value=httpx.Response(401, json={"error": {"message": "bad key", "code": None}})
+    )
+    payload = v2_payload(
+        conversation_id="cv_v2_decision_ambas",
+        llm={"provider": "openrouter", "model": "z-ai/glm-5.3-flash", "apiKey": "sk-negocio-invalida"},
+    )
+    result = await stateless.run_turn(ctx, payload, organization_id="org_a")
+    assert result.action == "silent"
+    assert result.decision is not None
+    assert result.decision["model"] == "fake-platform-model"  # el último que se intentó
+    assert result.decision["steps"] == []
+    assert "tokens" not in result.decision
+
+
+async def test_v2_decision_modelo_del_negocio_y_tokens_del_proveedor(respx_mock):
+    ctx = make_ctx()
+    mock_crm_basics(respx_mock, conv_id="cv_v2_decision_org")
+    respx_mock.post(OPENROUTER_CHAT).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"role": "assistant", "content": "Hola, ¿en qué te ayudo?"}}],
+                "usage": {"prompt_tokens": 321, "completion_tokens": 12},
+            },
+        )
+    )
+    payload = v2_payload(
+        conversation_id="cv_v2_decision_org",
+        llm={"provider": "openrouter", "model": "z-ai/glm-5.3-flash", "apiKey": "sk-del-negocio"},
+    )
+    result = await stateless.run_turn(ctx, payload, organization_id="org_a")
+    assert result.llm_answered_with == "org"
+    assert result.decision is not None
+    assert result.decision["model"] == "z-ai/glm-5.3-flash"
+    assert result.decision["tokens"] == {"input": 321, "output": 12}
+    assert ctx.llm.calls == []  # la plataforma ni se tocó
+
+
+async def test_v2_decision_tras_fallback_del_negocio_a_la_plataforma_dice_el_modelo_que_contesto(
+    respx_mock,
+):
+    ctx = make_ctx()
+    ctx.llm.replies = [LlmReply(content="Hola desde la plataforma", usage=LlmUsage(input=50, output=7))]
+    mock_crm_basics(respx_mock, conv_id="cv_v2_decision_fallback")
+    respx_mock.post(OPENROUTER_CHAT).mock(
+        return_value=httpx.Response(402, json={"error": {"message": "no credits", "code": None}})
+    )
+    payload = v2_payload(
+        conversation_id="cv_v2_decision_fallback",
+        llm={"provider": "openrouter", "model": "z-ai/glm-5.3-flash", "apiKey": "sk-sin-credito"},
+    )
+    result = await stateless.run_turn(ctx, payload, organization_id="org_a")
+    assert result.llm_source == "org" and result.llm_answered_with == "platform"
+    assert result.decision is not None
+    assert result.decision["model"] == "fake-platform-model"  # NO el del negocio
+    assert result.decision["tokens"] == {"input": 50, "output": 7}  # solo lo que sí se cobró
+
+
+async def test_v2_decision_sin_modelo_ni_uso_del_cliente_queda_unknown_y_sin_tokens(respx_mock):
+    class SinMetadatos(FakeLLM):
+        model = None  # type: ignore[assignment]
+
+    ctx = make_ctx(llm=SinMetadatos())
+    mock_crm_basics(respx_mock, conv_id="cv_v2_decision_nometa")
+    result = await stateless.run_turn(
+        ctx, v2_payload(conversation_id="cv_v2_decision_nometa"), organization_id="org_a"
+    )
+    assert result.action == "replied"
+    assert result.decision is not None
+    assert result.decision["model"] == "unknown"
+    assert "tokens" not in result.decision
+
+
+async def test_v2_decision_pasos_con_tope_de_20(respx_mock):
+    ctx = make_ctx()
+    ctx.llm.replies = [
+        tool_round(*[(f"t{i}", "handoff", {"reason": f"motivo {i}"}) for i in range(25)]),
+        LlmReply(content="Te paso con una persona."),
+    ]
+    mock_crm_basics(respx_mock, conv_id="cv_v2_decision_tope")
+    result = await stateless.run_turn(
+        ctx, v2_payload(conversation_id="cv_v2_decision_tope"), organization_id="org_a"
+    )
+    assert result.decision is not None
+    steps = result.decision["steps"]
+    assert len(steps) == 20
+    assert steps[0]["summary"] == "pasó a una persona: motivo 0"
+    assert steps[19]["summary"] == "pasó a una persona: motivo 19"
+
+
+async def test_v2_decision_latencia_es_del_turno_completo(respx_mock):
+    class Lento(FakeLLM):
+        async def complete(self, messages, tools=None):  # type: ignore[override]
+            await asyncio.sleep(0.08)
+            return await super().complete(messages, tools)
+
+    ctx = make_ctx(llm=Lento())
+    mock_crm_basics(respx_mock, conv_id="cv_v2_decision_lat")
+    result = await stateless.run_turn(
+        ctx, v2_payload(conversation_id="cv_v2_decision_lat"), organization_id="org_a"
+    )
+    assert result.decision is not None
+    assert isinstance(result.decision["latencyMs"], int)
+    assert result.decision["latencyMs"] >= 80
+
+
+async def test_v2_decision_tambien_en_silencio_tras_llegar_al_llm(respx_mock):
+    """El modelo contestó solo el marcador filtrado: se trata como agotado
+    (silencio + handoff), pero el turno SÍ llegó al LLM → trae `decision`."""
+    ctx = make_ctx()
+    ctx.llm.replies = [
+        tool_round(("t1", "route_out", {})),
+        LlmReply(content="[Respuesta de una persona del negocio]:"),
+    ]
+    mock_crm_basics(respx_mock, conv_id="cv_v2_decision_marker")
+    payload = v2_payload(
+        conversation_id="cv_v2_decision_marker",
+        history=[
+            hist("lead", "hola", pending=False),
+            hist("team", "ya te contesto", id="t1"),
+            hist("lead", "gracias", id="m2", pending=True),
+        ],
+    )
+    result = await stateless.run_turn(ctx, payload, organization_id="org_a")
+    assert result.action == "silent" and result.handoff_reason == "error"
+    assert result.decision is not None
+    assert result.decision["steps"] == [
+        {"tool": "route_out", "summary": "marcó al lead como no calificado", "ok": True}
+    ]
+
+
+async def test_v2_sin_pasar_por_el_llm_no_hay_decision(client, respx_mock):
+    """noop, silencio previo (ventana cerrada, chat pausado, no autorizado) y
+    reset no llegan al LLM: el sobre queda como siempre, sin `decision`."""
+    ctx = make_ctx()
+    mock_crm_basics(respx_mock, conv_id="cv_v2_decision_nollm")
+
+    noop = await stateless.run_turn(
+        ctx,
+        v2_payload(history=[hist("lead", "algo viejo", pending=False)]),
+        organization_id="org_a",
+    )
+    ventana = await stateless.run_turn(
+        ctx, v2_payload(window_open=False), organization_id="org_a"
+    )
+    pausado = await stateless.run_turn(
+        ctx, v2_payload(ai_enabled=False), organization_id="org_a"
+    )
+    no_autorizado = await stateless.run_turn(
+        ctx,
+        v2_payload(allowlist_enabled=True, allowed_wa_ids=["5215559990000"]),
+        organization_id="org_a",
+    )
+    for result in (noop, ventana, pausado, no_autorizado):
+        assert result.decision is None
+    assert ctx.llm.calls == []
+
+    # y por HTTP el sobre ni siquiera trae la llave
+    body = v2_body(window_open=False)
+    resp = await client.post("/dispatch", content=body, headers={"x-signature": sign(body)})
+    assert resp.status_code == 200
+    assert "decision" not in resp.json()
+
+
+async def test_v2_un_crm_que_ignora_decision_ve_el_mismo_sobre_de_siempre(client, respx_mock):
+    """Compatibilidad hacia atrás: quitando `decision`, el sobre es EXACTAMENTE
+    el del contrato anterior (`NeaResponseBody` del CRM: ok, action, llm,
+    handoff), y todo el cuerpo sigue siendo JSON plano serializable."""
+    mock_crm_basics(respx_mock, conv_id="cv_v2_decision_compat")
+    body = v2_body(conversation_id="cv_v2_decision_compat")
+    resp = await client.post("/dispatch", content=body, headers={"x-signature": sign(body)})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "decision" in data
+    sin_decision = {k: v for k, v in data.items() if k != "decision"}
+    assert sin_decision == {
+        "ok": True,
+        "action": "replied",
+        "llm": {"source": "platform", "status": "ok", "answeredWith": "platform"},
+        "handoff": None,
+    }
+    # lo que lee el CRM de verdad (solo estas llaves):
+    assert data["ok"] is True and data["action"] in {"replied", "silent", "noop", "reset"}
+    assert data["llm"]["source"] in {"org", "platform"} and data["llm"]["status"]
+    assert json.loads(json.dumps(data)) == data
+
+
+async def test_v1_no_trae_decision(client, respx_mock):
+    """v1/legacy no cambia: sigue contestando `{"ok": true}` a secas."""
+    from tests.test_dispatch import dispatch_body, sign as sign_v1
+
+    mock_crm_basics(respx_mock, conv_id="cv_v1_decision")
+    respx_mock.get(f"{CRM_URL}/api/bot/profile").mock(return_value=httpx.Response(404))
+    body = dispatch_body(organization_id="org_a", conversation_id="cv_v1_decision", wamid="wamid.v1d")
+    resp = await client.post("/dispatch", content=body, headers={"x-signature": sign_v1(body)})
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True}

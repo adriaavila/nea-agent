@@ -406,7 +406,7 @@ def _v2_body(result: "stateless.V2Result | None") -> dict[str, Any]:
     turno en segundo plano — se contesta lo mínimo honesto, `ok` a secas."""
     if result is None:
         return {"ok": True}
-    return {
+    body: dict[str, Any] = {
         "ok": True,
         "action": result.action,
         # `source` es del contrato: de quién es la clave que el CRM evalúa
@@ -425,6 +425,12 @@ def _v2_body(result: "stateless.V2Result | None") -> dict[str, Any]:
             else None
         ),
     }
+    # `decision` (rastro de decisión, app/decision.py): aditivo y opcional —
+    # solo en los turnos que llegaron al LLM. Un CRM que no lo conozca lo
+    # ignora igual que ya ignora `llm.answeredWith`.
+    if result.decision is not None:
+        body["decision"] = result.decision
+    return body
 
 
 async def _dispatch_v2(ctx: AppContext, raw_payload: dict[str, Any]) -> Any:
