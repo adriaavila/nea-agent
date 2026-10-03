@@ -1549,7 +1549,16 @@ async def test_v2_decision_resumenes_nunca_filtran_valores_ni_secretos(client, c
                     "geo": "Valencia, Carabobo",
                 },
             ),
-            ("t2", "handoff", {"reason": f"pidió llamada al {IDENTITY} o a dueno@clinica.com"}),
+            (
+                "t2",
+                "handoff",
+                {
+                    "reason": (
+                        f"Juan Pérez, cédula V-12345678, Av. Libertador 1234, "
+                        f"pidió llamada al {IDENTITY} o a dueno@clinica.com"
+                    )
+                },
+            ),
         ),
         LlmReply(content="Listo."),
     ]
@@ -1557,8 +1566,34 @@ async def test_v2_decision_resumenes_nunca_filtran_valores_ni_secretos(client, c
     resp2 = await client.post("/dispatch", content=body2, headers={"x-signature": sign(body2)})
     decision_json2 = json.dumps(resp2.json()["decision"], ensure_ascii=False)
     assert "actualizó lead: rubro, notas, zona" in decision_json2
-    for fuga in ("clínica dental", "9998877", "dueno@clinica.com", IDENTITY, "Valencia", "Carabobo"):
+    assert "pasó a una persona: pidió humano" in decision_json2  # frase fija, no el texto del modelo
+    for fuga in (
+        "clínica dental", "9998877", "dueno@clinica.com", IDENTITY, "Valencia", "Carabobo",
+        "Juan", "Pérez", "12345678", "Libertador",
+    ):
         assert fuga not in decision_json2
+
+
+async def test_v2_decision_claves_y_herramientas_inventadas_no_se_nombran(respx_mock):
+    """Lo que el modelo inventa (una clave de ficha o una herramienta con el
+    dato adentro) se reporta con etiquetas genéricas, jamás por su nombre."""
+    ctx = make_ctx()
+    ctx.llm.replies = [
+        tool_round(
+            ("t1", "update_ficha", {"rubro": "spa", "juan_perez": "x", "pw_hunter2": "y"}),
+            ("t2", "buscar_a_juan_perez_0414", {"q": "z"}),
+        ),
+        LlmReply(content="Listo."),
+    ]
+    mock_crm_basics(respx_mock, conv_id="cv_v2_decision_inventado")
+    result = await stateless.run_turn(
+        ctx, v2_payload(conversation_id="cv_v2_decision_inventado"), organization_id="org_a"
+    )
+    assert result.decision is not None
+    assert result.decision["steps"] == [
+        {"tool": "update_ficha", "summary": "actualizó lead: rubro, otros campos", "ok": True},
+        {"tool": "desconocida", "summary": "intentó usar una herramienta desconocida", "ok": False},
+    ]
 
 
 async def test_v2_prompt_version_estable_entre_turnos_con_distinta_hora(respx_mock, monkeypatch):
@@ -1720,8 +1755,13 @@ async def test_v2_decision_sin_modelo_ni_uso_del_cliente_queda_unknown_y_sin_tok
 
 async def test_v2_decision_pasos_con_tope_de_20(respx_mock):
     ctx = make_ctx()
+    ciclo = [
+        ("route_out", {}),
+        ("handoff", {"reason": "pidió humano"}),
+        ("update_ficha", {"rubro": "spa"}),
+    ]
     ctx.llm.replies = [
-        tool_round(*[(f"t{i}", "handoff", {"reason": f"motivo {i}"}) for i in range(25)]),
+        tool_round(*[(f"t{i}", *ciclo[i % 3]) for i in range(25)]),
         LlmReply(content="Te paso con una persona."),
     ]
     mock_crm_basics(respx_mock, conv_id="cv_v2_decision_tope")
@@ -1731,8 +1771,7 @@ async def test_v2_decision_pasos_con_tope_de_20(respx_mock):
     assert result.decision is not None
     steps = result.decision["steps"]
     assert len(steps) == 20
-    assert steps[0]["summary"] == "pasó a una persona: motivo 0"
-    assert steps[19]["summary"] == "pasó a una persona: motivo 19"
+    assert [s["tool"] for s in steps] == [ciclo[i % 3][0] for i in range(20)]  # orden de llamada
 
 
 async def test_v2_decision_latencia_es_del_turno_completo(respx_mock):

@@ -9,11 +9,13 @@ sobre — un CRM que lo ignore sigue funcionando igual (ver
 Dos reglas que este módulo hace cumplir, porque el resumen se muestra tal cual
 en una pantalla del negocio:
 
-- **Nada sensible.** Los resúmenes salen de plantillas fijas; lo poco que
-  entra de fuera (etiquetas de horarios del CRM, el motivo libre del
-  `handoff`) pasa por `_clean`, que tacha teléfonos, correos, enlaces y
-  claves. De la ficha del lead solo van los NOMBRES de los campos, jamás los
-  valores. Un fallo de herramienta lleva una razón corta, nunca un stack.
+- **Nada sensible.** Los resúmenes salen de plantillas fijas y de listas
+  cerradas: de la ficha del lead solo van nombres de campo CONOCIDOS (jamás
+  valores ni claves que invente el modelo), del `handoff` solo el motivo
+  canónico (nunca el texto libre del modelo, que puede traer nombres, cédulas
+  o direcciones), de un fallo solo un código conocido. Lo único que entra de
+  fuera es la etiqueta de un horario que arma el CRM; todo el resumen pasa
+  igual por `_clean`, que tacha teléfonos, correos, enlaces y claves.
 - **Jamás tumba un turno.** Armar el rastro es observabilidad: si el resumen
   de un paso falla, se cae a uno genérico en vez de propagar la excepción.
 """
@@ -25,17 +27,23 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from app.crm import canonical_handoff_reason
 from app.llm import LlmUsage
+from app.tools import TOOL_SCHEMAS
 
 logger = logging.getLogger("nea.decision")
 
 MAX_STEPS = 20
 MAX_SUMMARY_CHARS = 200
 UNKNOWN_MODEL = "unknown"
+UNKNOWN_TOOL = "desconocida"
+
+# Solo las herramientas que el modelo puede pedir de verdad: cualquier otro
+# nombre (inventado, o con datos escondidos) se reporta como "desconocida".
+_KNOWN_TOOLS = frozenset(schema["function"]["name"] for schema in TOOL_SCHEMAS)
 
 # Cuántos nombres de campo / horarios se listan antes de resumir con "y N más".
 _MAX_LISTED = 6
-_MAX_REASON_CHARS = 80
 
 # Nombres legibles de los campos de la ficha (app/tools.py:TOOL_SCHEMAS).
 _FICHA_LABELS = {
@@ -49,11 +57,16 @@ _FICHA_LABELS = {
     "resultado": "resultado",
     "notas": "notas",
 }
-# El LLM puede inventar claves: solo pasan las que parecen un identificador
-# corto y sin rachas de dígitos (un nombre de campo jamás debe poder cargar
-# un teléfono o un id).
-_SAFE_FIELD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,31}")
-_DIGIT_RUN_RE = re.compile(r"\d{4,}")
+
+# Motivo canónico del handoff (app/crm.py:canonical_handoff_reason, el mismo
+# catálogo cerrado que recibe el CRM) → frase fija. Jamás el texto libre.
+_HANDOFF_PHRASES = {
+    "cliente": "pidió humano",
+    "hostilidad": "mensajes hostiles",
+    "modelo": "decisión del agente",
+    "error": "error del agente",
+    "ventana": "ventana de 24 h cerrada",
+}
 
 # Razón corta (en español) de los errores que devuelve `ToolRuntime.execute`.
 _FAILURE_REASONS = {
@@ -65,23 +78,52 @@ _FAILURE_REASONS = {
     "slot_taken": "el horario ya estaba ocupado",
     "start_utc_invalido": "horario inválido",
 }
-_SAFE_CODE_RE = re.compile(r"[a-z][a-z0-9_]{0,39}")
 
 _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
 _URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
-_PHONE_RE = re.compile(r"\+?\d[\d\s().-]{5,}\d")
 _SECRET_RE = re.compile(
     r"\b(?:sk|pk|rk|whsec|ghp)[-_][A-Za-z0-9_-]{8,}|\b[A-Za-z0-9_-]{32,}\b"
 )
-_TOOL_NAME_RE = re.compile(r"[^A-Za-z0-9_.-]")
+
+# Fechas y horas (las etiquetas de horarios que arma el CRM: "lun 6 oct,
+# 10:00", "06-10-2026 10:00", "2026-10-06T10:00:00") NO son teléfonos. La
+# alternativa `when` va primero para ganar en cada posición; el lookbehind
+# obliga a que empiece en un borde de número (así "0414-12-3456" no se lee
+# como una fecha a partir de su segundo grupo).
+_TIME = r"\d{1,2}:\d{2}(?::\d{2})?"
+_DATE = r"\d{4}-\d{2}-\d{2}|\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}"
+_NUMBER_RE = re.compile(
+    rf"(?P<when>(?<![\d+])(?P<date>{_DATE})(?:[ T](?P<dtime>{_TIME}))?(?!\d)"
+    rf"|(?<![\d:])(?P<time>{_TIME})(?![\d:]))"
+    r"|(?P<phone>\+?\d[\d\s().-]{5,}\d)"
+)
 
 
-_ISO_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+def _valid_time(value: str) -> bool:
+    parts = [int(p) for p in value.split(":")]
+    return parts[0] <= 23 and all(p <= 59 for p in parts[1:])
 
 
-def _redact_phone(match: re.Match[str]) -> str:
+def _valid_date(value: str) -> bool:
+    first, second, third = re.split(r"[-/.]", value)
+    if len(first) == 4:  # año-mes-día
+        return 1 <= int(second) <= 12 and 1 <= int(third) <= 31
+    day_or_month, other = int(first), int(second)  # d-m-a o m-d-a
+    return 1 <= day_or_month <= 31 and 1 <= other <= 31 and min(day_or_month, other) <= 12
+
+
+def _is_when(match: re.Match[str]) -> bool:
+    """¿Es de verdad una fecha/hora y no un teléfono con la misma forma (p.ej.
+    "12-34-5678")? Se exige que mes/día y hora/minuto quepan."""
+    date, dtime, time = match.group("date"), match.group("dtime"), match.group("time")
+    if date is not None and not _valid_date(date):
+        return False
+    return all(_valid_time(t) for t in (dtime, time) if t is not None)
+
+
+def _redact_number(match: re.Match[str]) -> str:
     found = match.group()
-    if _ISO_DATE_RE.fullmatch(found):  # una fecha no es un teléfono
+    if match.group("when") is not None and _is_when(match):
         return found
     return "[número]" if sum(c.isdigit() for c in found) >= 7 else found
 
@@ -92,7 +134,7 @@ def _clean(text: str) -> str:
     text = _URL_RE.sub("[enlace]", text)
     text = _EMAIL_RE.sub("[correo]", text)
     text = _SECRET_RE.sub("[clave]", text)
-    text = _PHONE_RE.sub(_redact_phone, text)
+    text = _NUMBER_RE.sub(_redact_number, text)
     text = " ".join(text.split())
     if len(text) > MAX_SUMMARY_CHARS:
         text = text[: MAX_SUMMARY_CHARS - 1].rstrip() + "…"
@@ -116,19 +158,16 @@ def _ficha_fields(args: dict[str, Any]) -> list[str]:
     """Nombres (NUNCA valores) de los campos que `update_ficha` mandó, con los
     mismos criterios que `ToolRuntime._update_ficha` (los `None` no cuentan)."""
     names: list[str] = []
-    unknown = 0
+    unknown = False
     for key, value in args.items():
         if value is None:
             continue
-        key = str(key)
-        label = _FICHA_LABELS.get(key)
+        label = _FICHA_LABELS.get(str(key))
         if label is None:
-            if _SAFE_FIELD_RE.fullmatch(key) and not _DIGIT_RUN_RE.search(key):
-                label = key.replace("_", " ")
-            else:
-                unknown += 1
-                continue
-        if label not in names:
+            # El modelo puede inventar claves ("juan_perez", "pw_hunter2"):
+            # un nombre de campo desconocido jamás se imprime.
+            unknown = True
+        elif label not in names:
             names.append(label)
     if unknown:
         names.append("otros campos")
@@ -141,9 +180,7 @@ def _failure_reason(result: dict[str, Any]) -> str:
         return _FAILURE_REASONS[error]
     if error.startswith("herramienta desconocida"):
         return "herramienta desconocida"
-    if _SAFE_CODE_RE.fullmatch(error):
-        return error.replace("_", " ")
-    return "error"
+    return "error"  # cualquier otro código (o texto libre) no se muestra
 
 
 def _step_summary(tool: str, args: dict[str, Any], result: dict[str, Any]) -> str:
@@ -174,8 +211,12 @@ def _step_summary(tool: str, args: dict[str, Any], result: dict[str, Any]) -> st
             return "marcó al lead como no calificado" + extra
         return "intentó marcar al lead como no calificado"
     if tool == "handoff":
-        reason = " ".join(str(args.get("reason") or "").split())[:_MAX_REASON_CHARS]
-        return f"pasó a una persona: {reason}" if reason else "pasó a una persona"
+        # Mismo motivo que recibe el CRM (catálogo cerrado), jamás el texto
+        # libre del modelo. Sin motivo, el runtime usa "lead_request".
+        reason = canonical_handoff_reason(str(args.get("reason") or "lead_request"))
+        return f"pasó a una persona: {_HANDOFF_PHRASES[reason]}"
+    if tool == UNKNOWN_TOOL:
+        return "intentó usar una herramienta desconocida"
     return f"usó {tool}"
 
 
@@ -184,8 +225,9 @@ def summarize_step(tool: str, args: dict[str, Any], result: Any) -> tuple[str, b
     `ToolRuntime.execute`; el resumen ya sale limpio y de ≤200 caracteres."""
     res = result if isinstance(result, dict) else {}
     ok = bool(res.get("ok"))
+    tool = tool if tool in _KNOWN_TOOLS else UNKNOWN_TOOL
     summary = _step_summary(tool, args if isinstance(args, dict) else {}, res)
-    if not ok:
+    if not ok and tool != UNKNOWN_TOOL:
         summary += f" (falló: {_failure_reason(res)})"
     return _clean(summary), ok
 
@@ -221,12 +263,19 @@ class DecisionTrace:
     def add_step(self, tool: str, args: dict[str, Any], result: Any) -> None:
         if len(self.steps) >= MAX_STEPS:
             return
-        name = _TOOL_NAME_RE.sub("", str(tool))[:64] or "desconocida"
+        # Solo herramientas de TOOL_SCHEMAS: un nombre inventado puede cargar
+        # datos, así que se reporta como "desconocida".
+        name = tool if tool in _KNOWN_TOOLS else UNKNOWN_TOOL
         try:
             summary, ok = summarize_step(name, args, result)
         except Exception:  # observabilidad: jamás tumba el turno
             logger.exception("decision: no pude resumir el paso %s", name)
-            summary, ok = f"usó {name}", bool(isinstance(result, dict) and result.get("ok"))
+            summary = (
+                "intentó usar una herramienta desconocida"
+                if name == UNKNOWN_TOOL
+                else f"usó {name}"
+            )
+            ok = bool(isinstance(result, dict) and result.get("ok"))
         self.steps.append({"tool": name, "summary": summary, "ok": ok})
 
     def to_dict(self) -> dict[str, Any]:
