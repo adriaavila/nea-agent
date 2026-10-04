@@ -30,11 +30,17 @@ from pydantic import BaseModel, Field, SecretStr, field_validator
 from app import media
 from app.config import access_policy, canonical_identity
 from app.crm import CrmClient, CrmConflict, CrmError, CrmPaymentRequired, canonical_handoff_reason
+from app.decision import DecisionTrace
 from app.hostility import ALERT as HOSTILITY_ALERT, hostile_streak
 from app.llm import Llm, LlmAuthFailed, LlmExhausted, LlmNoCredits, OpenAiLlm
 from app.multiorg import crm_for
 from app.profile import BusinessProfile, profile_from_payload
-from app.prompt import TEAM_OWNER_MARKER_PREFIX, TEAM_OWNER_NOTE, build_system_prompt
+from app.prompt import (
+    TEAM_OWNER_MARKER_PREFIX,
+    TEAM_OWNER_NOTE,
+    build_system_prompt,
+    prompt_version,
+)
 from app.state import AppContext, Conversation, InboundMessage, OfferedSlot, TurnCommit
 from app.tools import TOOL_SCHEMAS, AlreadyBooked, MemoryOfferBook, ToolRuntime
 from app.turn import _agent_tz
@@ -152,6 +158,9 @@ class V2Result:
     llm_answered_with: str = "platform"
     handoff_reason: str | None = None
     handoff_applied: bool | None = None
+    #: Rastro de decisión (app/decision.py) — solo en los turnos que llegaron
+    #: al LLM; `None` en noop/silencio previo/reset. Aditivo y opcional.
+    decision: dict[str, Any] | None = None
 
 
 @dataclass
@@ -550,6 +559,7 @@ async def _tool_loop(
     org_llm: Llm | None,
     platform_llm: Llm,
     state: _LlmState,
+    trace: DecisionTrace | None = None,
 ) -> str | None:
     """Rondas de tool-calling hasta obtener texto final (o rendirse) — igual
     que app/turn.py._tool_loop, más el fallback de clave por negocio: si el
@@ -560,8 +570,15 @@ async def _tool_loop(
 
     Nota: `state.source` NUNCA se toca aquí — se fija una sola vez al armar
     `state` (ver `run_turn`) y representa de quién es la clave reportada, no
-    quién contestó (ver `V2Result`)."""
+    quién contestó (ver `V2Result`).
+
+    `trace` (rastro de decisión, app/decision.py) registra el modelo del
+    cliente que contesta —el de la plataforma tras un fallback—, los tokens
+    de cada respuesta y un paso por cada herramienta que se ejecuta; sigue
+    lleno aunque el loop termine en `LlmExhausted`."""
+    trace = trace if trace is not None else DecisionTrace()
     active = org_llm or platform_llm
+    trace.use_model(active)
     for _ in range(MAX_TOOL_ROUNDS):
         try:
             reply = await active.complete(messages, tools=TOOL_SCHEMAS)
@@ -586,10 +603,12 @@ async def _tool_loop(
                 "stateless: LLM del negocio falló (%s) — cae a la plataforma", exc
             )
             active = platform_llm
+            trace.use_model(active)
             try:
                 reply = await active.complete(messages, tools=TOOL_SCHEMAS)
             except (LlmAuthFailed, LlmNoCredits) as exc2:
                 raise LlmExhausted(str(exc2)) from exc2
+        trace.add_usage(reply.usage)
         if not reply.tool_calls:
             return reply.content
         messages.append(
@@ -611,6 +630,7 @@ async def _tool_loop(
         )
         for tc in reply.tool_calls:
             result = await runtime.execute(tc.name, tc.arguments)
+            trace.add_step(tc.name, tc.arguments, result)
             messages.append(
                 {
                     "role": "tool",
@@ -715,7 +735,11 @@ async def run_turn(
     commit: TurnCommit | None = None,
 ) -> V2Result:
     """Corre UN turno v2 completo. `ctx.store` NUNCA se toca — todo lo que se
-    necesita ya viene en `payload` (ver el docstring del módulo)."""
+    necesita ya viene en `payload` (ver el docstring del módulo).
+
+    Los turnos que llegan al LLM devuelven además `decision` (rastro de
+    decisión, app/decision.py); el reloj de su `latencyMs` arranca aquí."""
+    trace = DecisionTrace()
     context = payload.context or {}
     conv_info = dict(context.get("conversation") or {})
     conversation_id = (payload.conversationId or "").strip()
@@ -803,6 +827,7 @@ async def run_turn(
         offered=await offer_book.get(),
         tz=_agent_tz(ctx.settings, profile),
     )
+    trace.prompt_version = prompt_version(profile)
     messages: list[dict[str, Any]] = [{"role": "system", "content": system}]
     if had_team_or_owner:
         messages.append({"role": "system", "content": TEAM_OWNER_NOTE})
@@ -842,7 +867,9 @@ async def run_turn(
     )
     try:
         try:
-            final_text = await _tool_loop(messages, runtime, org_llm, ctx.llm, state)
+            final_text = await _tool_loop(
+                messages, runtime, org_llm, ctx.llm, state, trace
+            )
         except LlmExhausted as exc:
             logger.error(
                 "stateless %s: LLM agotó reintentos (%s) — silencio + handoff error",
@@ -857,6 +884,7 @@ async def run_turn(
                 llm_answered_with=state.answered_with,
                 handoff_reason="error",
                 handoff_applied=applied,
+                decision=trace.to_dict(),
             )
     finally:
         if org_llm is not None:
@@ -892,6 +920,7 @@ async def run_turn(
                 llm_answered_with=state.answered_with,
                 handoff_reason=canonical_handoff_reason(reason),
                 handoff_applied=applied,
+                decision=trace.to_dict(),
             )
         sent = await _send(
             scoped_crm,
@@ -916,4 +945,5 @@ async def run_turn(
         llm_answered_with=state.answered_with,
         handoff_reason=handoff_reason,
         handoff_applied=handoff_applied,
+        decision=trace.to_dict(),
     )

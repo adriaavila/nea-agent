@@ -122,6 +122,38 @@ lo tiene cualquier despliegue normal, así que por sí sola dejaría arrancar en
 verde a un despliegue clásico que se quedó sin secreto, y Meta empezaría a
 recibir 401 sin que nada avise).
 
+### Rastro de decisión (`decision`, despacho v2)
+
+Cada turno v2 que llega al LLM responde, además de `ok/action/llm/handoff`,
+un campo opcional `decision` para que el dueño vea qué hizo el agente y por
+qué (el CRM que no lo conozca lo ignora):
+
+```json
+"decision": {
+  "model": "gpt-4o-mini",
+  "promptVersion": "895edf41e858",
+  "steps": [{ "tool": "propose_slots", "summary": "ofreció 2 horarios: lunes 10:00, martes 10:00", "ok": true }],
+  "latencyMs": 1840,
+  "tokens": { "input": 4300, "output": 85 }
+}
+```
+
+- `model`: el que contestó de verdad (tras un fallback del negocio a la
+  plataforma, el de la plataforma). `promptVersion`: 12 hex del sha256 de lo
+  que fija el comportamiento y no cambia por turno (chasis, perfil del
+  negocio, `TOOL_SCHEMAS`, la nota de equipo y la alerta de hostilidad), SIN
+  la parte por turno (hora, lead, horarios ofrecidos).
+- `steps`: las herramientas en orden de llamada (máx. 20), con un resumen en
+  español de plantillas fijas. De la ficha solo nombres de campo conocidos
+  (cualquier otra clave es "otros campos"), del handoff solo el motivo
+  canónico en una frase fija (nunca el texto libre del modelo), y una
+  herramienta fuera de `TOOL_SCHEMAS` se reporta como `desconocida`. Un paso
+  fallido trae `ok: false` y una razón de un catálogo cerrado, sin stack.
+- `tokens` se omite si el cliente LLM no reporta uso. Turnos que no llegan al
+  LLM (noop, silencio previo, reset) no llevan `decision`. v1 no cambia.
+
+Código: `app/decision.py`.
+
 ### La agenda, contra el motor universal del CRM (Vocero 015)
 
 `propose_slots` no solo consulta: **registra**. `GET /api/bot/availability`

@@ -63,9 +63,21 @@ class ToolCall:
 
 
 @dataclass
+class LlmUsage:
+    """Tokens que el proveedor cobró por UNA respuesta (la que se devolvió)."""
+
+    input: int = 0
+    output: int = 0
+
+
+@dataclass
 class LlmReply:
     content: str | None
     tool_calls: list[ToolCall] = field(default_factory=list)
+    #: `None` si el proveedor no reportó uso (o el cliente es un fake). Va en
+    #: la respuesta, no en un contador compartido: el cliente de plataforma
+    #: atiende turnos concurrentes y un delta de contadores se mezclaría.
+    usage: LlmUsage | None = None
 
 
 class Llm(Protocol):
@@ -208,6 +220,11 @@ class OpenAiLlm:
         # reportados por el proveedor, acumulados por instancia.
         self.usage = {"prompt": 0, "cached": 0, "completion": 0, "llamadas": 0}
 
+    @property
+    def model(self) -> str:
+        """Id del modelo de chat con el que responde este cliente."""
+        return self._model
+
     async def transcribe(
         self, data: bytes, mime: str, filename: str = "audio.ogg"
     ) -> str:
@@ -313,14 +330,19 @@ class OpenAiLlm:
                     model=self._model, messages=messages, **kwargs
                 )
                 u = getattr(resp, "usage", None)
+                reply_usage: LlmUsage | None = None
                 if u is not None:
                     det = getattr(u, "prompt_tokens_details", None)
+                    prompt_tokens = getattr(u, "prompt_tokens", 0) or 0
+                    completion_tokens = getattr(u, "completion_tokens", 0) or 0
                     self.usage["llamadas"] += 1
-                    self.usage["prompt"] += getattr(u, "prompt_tokens", 0) or 0
-                    self.usage["completion"] += getattr(u, "completion_tokens", 0) or 0
+                    self.usage["prompt"] += prompt_tokens
+                    self.usage["completion"] += completion_tokens
                     self.usage["cached"] += getattr(det, "cached_tokens", 0) or 0
+                    reply_usage = LlmUsage(input=prompt_tokens, output=completion_tokens)
                 reply = self._parse(resp)
                 if reply.content or reply.tool_calls:
+                    reply.usage = reply_usage
                     return reply
                 last_error = ValueError("respuesta vacía del LLM (sin content ni tools)")
                 logger.warning("llm: respuesta vacía, intento %d", attempt + 1)

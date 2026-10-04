@@ -23,6 +23,10 @@ CRM_CONV_ID = "cv_test1"
 class FakeLLM:
     """LLM determinista: entrega respuestas en cola y registra las llamadas."""
 
+    #: Id que `decision.model` reporta cuando este fake contesta (el de un
+    #: OpenAiLlm real sale de `OpenAiLlm.model`).
+    model = "fake-platform-model"
+
     def __init__(self, replies: list[LlmReply] | None = None) -> None:
         self.replies = list(replies or [])
         self.calls: list[dict[str, Any]] = []

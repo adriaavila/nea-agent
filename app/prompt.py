@@ -11,12 +11,15 @@ comportamiento end-to-end (ver README, "Definición de Hecho").
 """
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
+from app.hostility import ALERT as HOSTILITY_ALERT
 from app.profile import BusinessProfile
 from app.state import Conversation, OfferedSlot
+from app.tools import TOOL_SCHEMAS
 
 DEFAULT_TZ = ZoneInfo("America/Mexico_City")
 
@@ -133,6 +136,34 @@ def _fmt_local(dt: datetime, tz: ZoneInfo) -> str:
     )
 
 
+def stable_prompt(profile: BusinessProfile) -> str:
+    """La parte del system prompt que SOLO depende del negocio: chasis +
+    perfil. Excluye el bloque "CONTEXTO ACTUAL" (fecha/hora, nombre y ficha
+    del lead, horarios ofrecidos, cita agendada), que cambia en cada turno."""
+    return _chassis(profile) + "\n\n" + _business_block(profile)
+
+
+def prompt_version(profile: BusinessProfile) -> str:
+    """Huella (12 hex de sha256) de TODO lo que fija cómo se comporta el
+    agente y no cambia por turno: `stable_prompt` (chasis + perfil del
+    negocio), las herramientas que ve el modelo (`TOOL_SCHEMAS`, con sus
+    descripciones) y los dos avisos de sistema que el despacho v2 añade según
+    el caso (`TEAM_OWNER_NOTE`, `HOSTILITY_ALERT`). Dos turnos con lo mismo
+    comparten versión aunque cambie la hora o el lead; editar el perfil, el
+    chasis, una herramienta o uno de los avisos la cambia. Va en
+    `decision.promptVersion` para que el dueño vea con qué reglas decidió el
+    agente."""
+    material = "\n\x1e".join(
+        (
+            stable_prompt(profile),
+            json.dumps(TOOL_SCHEMAS, sort_keys=True, ensure_ascii=False),
+            TEAM_OWNER_NOTE,
+            HOSTILITY_ALERT,
+        )
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:12]
+
+
 def build_system_prompt(
     *,
     profile: BusinessProfile,
@@ -191,13 +222,7 @@ def build_system_prompt(
             "No agendes otra; si quiere cambiarla, handoff."
         )
 
-    return (
-        _chassis(profile)
-        + "\n\n"
-        + _business_block(profile)
-        + "\n"
-        + "\n".join(lines)
-    )
+    return stable_prompt(profile) + "\n" + "\n".join(lines)
 
 
 #: Despacho v2 (app/stateless.py): el historial que manda el CRM incluye las

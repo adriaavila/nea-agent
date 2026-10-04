@@ -12,7 +12,7 @@ from app.profile import (
     profile_from_payload,
     resolve_profile,
 )
-from app.prompt import build_system_prompt
+from app.prompt import build_system_prompt, prompt_version, stable_prompt
 from app.state import Conversation
 
 
@@ -141,3 +141,101 @@ def test_prompt_minimo_advierte_falta_de_conocimiento():
 @pytest.mark.parametrize("kb", [None, "  "])
 def test_has_knowledge_falso_con_kb_vacio(kb):
     assert not BusinessProfile(kb_text=kb).has_knowledge
+
+
+# ------------------------------------------------------- prompt_version ---
+
+
+def test_prompt_version_son_12_hex_y_determinista():
+    prof = profile_from_payload(PAYLOAD, default_name="Nea")
+    version = prompt_version(prof)
+    assert len(version) == 12
+    int(version, 16)  # es hex
+    assert prompt_version(prof) == version
+    # perfil igual construido aparte → misma versión
+    assert prompt_version(profile_from_payload(PAYLOAD, default_name="Nea")) == version
+
+
+def test_prompt_version_ignora_la_parte_por_turno_del_prompt():
+    """El bloque "CONTEXTO ACTUAL" (hora, lead, horarios ofrecidos) cambia en
+    cada turno y NO entra en la versión: el system prompt completo de dos
+    turnos puede diferir y la versión es la misma."""
+    from datetime import datetime, timezone
+
+    prof = profile_from_payload(PAYLOAD, default_name="Nea")
+    ctx_a = {"contact": {"name": "Ana", "ficha": {"rubro": "dentista"}}}
+    ctx_b = {"contact": {"name": "Beto", "ficha": {}}}
+    full_a = build_system_prompt(
+        profile=prof,
+        context=ctx_a,
+        conv=_conv(),
+        now=datetime(2026, 10, 1, 9, 0, tzinfo=timezone.utc),
+    )
+    full_b = build_system_prompt(
+        profile=prof,
+        context=ctx_b,
+        conv=_conv(),
+        now=datetime(2026, 10, 2, 17, 30, tzinfo=timezone.utc),
+    )
+    assert full_a != full_b
+    # el prompt completo es exactamente la parte estable + el bloque del turno
+    assert full_a.startswith(stable_prompt(prof) + "\n")
+    assert full_b.startswith(stable_prompt(prof) + "\n")
+    assert "CONTEXTO ACTUAL" not in stable_prompt(prof)
+
+
+@pytest.mark.parametrize(
+    "cambio",
+    [
+        {"instructions": "Vendemos blanqueamientos."},
+        {"tone": "formal"},
+        {"agent_name": "Max"},
+        {"kb_text": "P: ¿Precio? R: $900"},
+    ],
+)
+def test_prompt_version_cambia_cuando_cambia_el_perfil_del_negocio(cambio):
+    from dataclasses import replace
+
+    prof = profile_from_payload(PAYLOAD, default_name="Nea")
+    assert prompt_version(replace(prof, **cambio)) != prompt_version(prof)
+
+
+@pytest.mark.parametrize("pieza", ["TOOL_SCHEMAS", "TEAM_OWNER_NOTE", "HOSTILITY_ALERT"])
+def test_prompt_version_cubre_lo_que_cambia_el_comportamiento_en_codigo(pieza, monkeypatch):
+    """No solo el perfil: las herramientas que ve el modelo (con sus
+    descripciones) y los dos avisos de sistema del despacho v2 también fijan
+    cómo decide el agente, así que editarlos cambia la versión."""
+    import copy
+
+    from app import prompt as prompt_module
+
+    prof = profile_from_payload(PAYLOAD, default_name="Nea")
+    base = prompt_version(prof)
+
+    original = getattr(prompt_module, pieza)
+    if pieza == "TOOL_SCHEMAS":
+        editado = copy.deepcopy(original)
+        editado[0]["function"]["description"] += " Ahora también valida el rol."
+    else:
+        editado = original + " (regla nueva)"
+    monkeypatch.setattr(prompt_module, pieza, editado)
+
+    assert prompt_version(prof) != base
+    monkeypatch.setattr(prompt_module, pieza, original)
+    assert prompt_version(prof) == base  # y volver atrás devuelve la misma versión
+
+
+def test_prompt_version_sigue_estable_con_herramientas_y_avisos_incluidos():
+    """Contraprueba de lo anterior: sumar código a la huella no la vuelve
+    dependiente del contexto del turno."""
+    from datetime import datetime, timezone
+
+    prof = profile_from_payload(PAYLOAD, default_name="Nea")
+    antes = prompt_version(prof)
+    build_system_prompt(
+        profile=prof,
+        context={"contact": {"name": "Ana"}},
+        conv=_conv(),
+        now=datetime(2030, 1, 1, tzinfo=timezone.utc),
+    )
+    assert prompt_version(prof) == antes
