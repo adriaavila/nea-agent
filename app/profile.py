@@ -18,6 +18,7 @@ si nunca hubo uno, el fallback.
 from __future__ import annotations
 
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -52,6 +53,13 @@ class BusinessProfile:
     #: Es la MISMA con la que el motor de agenda etiqueta los huecos. `None`
     #: significa "el CRM no la dijo" y manda entonces AGENT_TIMEZONE.
     timezone: str | None = None
+    #: Horario del EQUIPO que el dueño puso en «Tu negocio» (`agent_profile`):
+    #: `{"mon": [{"start": "09:00", "end": "18:00"}], ...}`. Vacío = no lo dijo.
+    #: El agente lo usa para contestar "¿a qué hora abren?" y para decir
+    #: cuándo vuelve el equipo cuando pasa la conversación a una persona.
+    business_hours: dict[str, tuple[tuple[str, str], ...]] = field(default_factory=dict)
+    #: Zona de ese horario (la que el dueño eligió en «Tu negocio»).
+    business_timezone: str | None = None
 
     @property
     def has_knowledge(self) -> bool:
@@ -88,7 +96,37 @@ def profile_from_payload(payload: dict[str, Any], default_name: str) -> Business
         timezone=(str(prof.get("timezone")).strip() or None)
         if prof.get("timezone")
         else None,
+        business_hours=_business_hours(prof.get("businessHours")),
+        business_timezone=(str(prof.get("businessTimezone")).strip() or None)
+        if prof.get("businessTimezone")
+        else None,
     )
+
+
+WEEKDAY_KEYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+_HHMM = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+
+
+def _business_hours(raw: Any) -> dict[str, tuple[tuple[str, str], ...]]:
+    """Tolerante: lo que no sea `{dia: [{start, end}]}` con HH:MM se ignora
+    (un horario mal formado nunca tumba el turno, solo no se menciona)."""
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, tuple[tuple[str, str], ...]] = {}
+    for day in WEEKDAY_KEYS:
+        intervals = raw.get(day)
+        if not isinstance(intervals, list):
+            continue
+        ok = tuple(
+            (str(i.get("start")), str(i.get("end")))
+            for i in intervals
+            if isinstance(i, dict)
+            and _HHMM.match(str(i.get("start") or ""))
+            and _HHMM.match(str(i.get("end") or ""))
+        )
+        if ok:
+            out[day] = ok
+    return out
 
 
 def profile_from_brief(path: Path, default_name: str) -> BusinessProfile | None:

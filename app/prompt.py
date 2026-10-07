@@ -16,6 +16,7 @@ import json
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
+from app.horario import describe_hours, describe_next_open, team_status
 from app.hostility import ALERT as HOSTILITY_ALERT
 from app.profile import BusinessProfile
 from app.state import Conversation, OfferedSlot
@@ -51,6 +52,7 @@ SI NO CALIFICA (según los criterios del negocio):
 → Despídelo con honestidad y sin herir, dejando la puerta abierta. Si el negocio definió recursos alternativos, compártelos. Llama route_out para registrarlo.
 
 HANDOFF (llama la herramienta handoff): si piden hablar con una persona (SIEMPRE, a la primera), si es el TERCER mensaje hostil seguido del lead (obligatorio — regla de abajo), duda fuera del conocimiento aprobado, o frustración/confusión evidente. Las reglas de escalado del perfil del negocio se suman a estas.
+Al pasar a una persona, dile al lead con honestidad cuándo le van a contestar: si el contexto dice que el equipo está fuera de horario, menciona cuándo vuelve; nunca prometas "en un momento" si nadie está atendiendo.
 Hostilidad: una grosería suelta no te inmuta — aguantas vara con dignidad, sin engancharte ni sermonear. Pero LLEVA LA CUENTA de los mensajes hostiles (reclamo agresivo, desprecio, burla, insulto — cuentan TODOS, aunque sean distintos entre sí). Al TERCERO seguido se acabó el guion: escribe una única línea digna de cierre (sin invitación, sin pitch, sin pregunta) Y llama handoff con razón "hostilidad" EN ESE MISMO TURNO. Este handoff NO es para "premiarlo con un humano": es una alerta interna para que el dueño VEA la conversación y decida él (responder, ignorar o bloquear). Cerrar sin llamar handoff es un error de protocolo: no anuncias nada, cierras sobrio y la herramienta avisa por dentro.
 
 HERRAMIENTAS (jamás las menciones al lead, ni nada técnico):
@@ -96,6 +98,13 @@ def _business_block(profile: BusinessProfile) -> str:
             "Recursos alternativos para leads que no califican (compártelos al "
             f"despedirlos con route_out):\n{recursos}"
         )
+    horario = describe_hours(profile.business_hours)
+    if horario:
+        zona = f" (hora de {profile.business_timezone})" if profile.business_timezone else ""
+        lines.append(
+            f"Horario de atención del equipo{zona}: {horario}. Con esto contestas "
+            "si preguntan a qué hora abren o atienden."
+        )
     lines.append(
         "CONOCIMIENTO DEL NEGOCIO (tu única fuente de verdad; si algo no está "
         "aquí ni en las instrucciones, NO lo inventes — dilo con honestidad o "
@@ -124,6 +133,13 @@ _MESES = (
     "enero", "febrero", "marzo", "abril", "mayo", "junio",
     "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre",
 )
+
+
+def _zone(name: str | None) -> ZoneInfo | None:
+    try:
+        return ZoneInfo(name) if name else None
+    except Exception:
+        return None
 
 
 def _fmt_local(dt: datetime, tz: ZoneInfo) -> str:
@@ -217,10 +233,22 @@ def build_system_prompt(
 
     booking = ((context or {}).get("booking") or {}).get("next")
     if booking:
+        cuando = booking.get("label") or booking.get("scheduledAtUtc") or booking.get("scheduledAt")
         lines.append(
-            f"- El lead YA tiene cita agendada: {booking.get('label') or booking.get('scheduledAt')}. "
-            "No agendes otra; si quiere cambiarla, handoff."
+            f"- El lead YA tiene cita agendada: {cuando}. No agendes otra; si quiere "
+            "moverla, usa propose_slots y reschedule_session; si quiere cancelarla, handoff."
         )
+
+    if profile.business_hours:
+        htz = _zone(profile.business_timezone) or tz
+        abierto, proxima = team_status(profile.business_hours, htz, now)
+        if abierto:
+            lines.append("- El equipo del negocio está en horario de atención ahora mismo.")
+        elif proxima is not None:
+            lines.append(
+                "- El equipo del negocio está FUERA de horario ahora; vuelve a "
+                f"atender {describe_next_open(proxima, now)}."
+            )
 
     return stable_prompt(profile) + "\n" + "\n".join(lines)
 

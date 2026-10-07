@@ -393,6 +393,42 @@ async def _process_pending(
 # --------------------------------------------------------------- prompt ---
 
 
+#: Desde cuántas horas de silencio el agente lo debe saber: menos que esto es
+#: la misma charla; más, y "como te decía" suena a robot que no ve el reloj.
+GAP_NOTE_HOURS = 6
+
+
+def _parse_at(raw: str | None) -> datetime | None:
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _gap_note(prev: datetime | None, at: datetime | None) -> str | None:
+    """Aviso de sistema cuando pasó mucho tiempo entre dos mensajes. Sin él el
+    modelo ve un hilo continuo y retoma una charla de hace una semana como si
+    fuera de hace un minuto (sin saludar, o volviendo a una oferta vencida)."""
+    if prev is None or at is None:
+        return None
+    hours = (at - prev).total_seconds() / 3600
+    if hours < GAP_NOTE_HOURS:
+        return None
+    if hours < 36:
+        cuanto = f"unas {round(hours)} horas"
+    else:
+        dias = round(hours / 24)
+        cuanto = f"{dias} días" if dias < 60 else "más de dos meses"
+    return (
+        f"(Pasaron {cuanto} sin mensajes en esta conversación. Retómala como "
+        "alguien que vuelve a escribir: no sigas como si fuera la misma charla, "
+        "y lo que se ofreció antes puede ya no valer.)"
+    )
+
+
 def _history_messages(
     history: list[DispatchHistoryItemIn],
 ) -> tuple[list[dict[str, Any]], bool]:
@@ -401,7 +437,16 @@ def _history_messages(
     llevan un marcador — nunca los escribió el lead ni Nea."""
     out: list[dict[str, Any]] = []
     had_team_or_owner = False
+    prev_at: datetime | None = None
     for item in history:
+        # La pausa se marca también antes de lo pendiente: es justo ahí donde
+        # un lead que vuelve después de días necesita que el agente lo note.
+        at = _parse_at(item.at)
+        gap = _gap_note(prev_at, at)
+        if gap:
+            out.append({"role": "system", "content": gap})
+        if at is not None:
+            prev_at = at
         if item.role == "lead" and item.pending:
             continue
         if item.role == "lead":
