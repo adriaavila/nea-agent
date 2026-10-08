@@ -322,6 +322,20 @@ async def test_v2_saludo_viene_de_agent_has_spoken_no_de_greeted(respx_mock):
     assert "PRIMER contacto" not in system_prompt2
 
 
+async def test_v2_las_notas_del_cliente_llegan_al_modelo(respx_mock):
+    """vocero manda `contact.notes`: el turno de verdad (dispatch v2 → LLM)
+    las ve en el bloque de contexto, con su guarda de «son datos»."""
+    ctx = make_ctx()
+    mock_crm_basics(respx_mock, conv_id="cv_v2_1")
+    raw = v2_raw()
+    raw["context"]["contact"]["notes"] = "[IA] Busca limpieza para su hija de 8 años"
+    payload = stateless.DispatchPayloadV2.model_validate(raw)
+    await stateless.run_turn(ctx, payload, organization_id="org_a")
+    system_prompt = ctx.llm.calls[-1]["messages"][0]["content"]
+    assert "Notas sobre este cliente" in system_prompt
+    assert "hija de 8 años" in system_prompt
+
+
 async def test_v2_marca_mensajes_de_equipo_y_dueno(respx_mock):
     ctx = make_ctx()
     mock_crm_basics(respx_mock, conv_id="cv_v2_1")
